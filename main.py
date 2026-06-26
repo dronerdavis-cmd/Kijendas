@@ -3,15 +3,12 @@ import re
 import html
 import sqlite3
 import logging
-from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputMediaPhoto,
-    InputMediaDocument,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -29,9 +26,6 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# آیدی ادمین‌ها را با کاما جدا کن:
-# مثال:
-# ADMIN_IDS=123456789,987654321
 ADMIN_IDS = set()
 for x in os.getenv("ADMIN_IDS", "").split(","):
     x = x.strip()
@@ -48,7 +42,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =========================================================
-# STATES (manual, single-file approach)
+# STATES
 # =========================================================
 
 USER_STATES: Dict[int, Dict[str, Any]] = {}
@@ -227,7 +221,10 @@ def create_report(data: Dict[str, Any], reporter_user_id: int) -> int:
     report_id = cur.lastrowid
 
     case_code = f"RPT-{report_id:06d}"
-    cur.execute("UPDATE reports SET case_code = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (case_code, report_id))
+    cur.execute(
+        "UPDATE reports SET case_code = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (case_code, report_id)
+    )
 
     for ev in data.get("evidences", []):
         cur.execute("""
@@ -256,15 +253,6 @@ def get_report_by_id(report_id: int):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT * FROM reports WHERE id = ?", (report_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def get_report_by_case_code(case_code: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM reports WHERE case_code = ?", (case_code,))
     row = cur.fetchone()
     conn.close()
     return row
@@ -338,28 +326,6 @@ def search_reports(query: str, limit: int = 20):
             OR amount LIKE ?
             OR description LIKE ?
         )
-    ORDER BY id DESC
-    LIMIT ?
-    """, (q, q, q, q, q, q, q, limit))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def search_all_reports_admin(query: str, limit: int = 20):
-    q = f"%{query.strip()}%"
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-    SELECT * FROM reports
-    WHERE
-        case_code LIKE ?
-        OR target_card_number LIKE ?
-        OR target_full_name LIKE ?
-        OR target_phone LIKE ?
-        OR target_telegram_id LIKE ?
-        OR amount LIKE ?
-        OR description LIKE ?
     ORDER BY id DESC
     LIMIT ?
     """, (q, q, q, q, q, q, q, limit))
@@ -512,7 +478,7 @@ def step_prompt(step: str) -> str:
         "phone": "شماره تماس را وارد کنید یا رد کنید.",
         "telegram_id": "آیدی تلگرام را وارد کنید یا رد کنید. مثل: @username",
         "amount": "مبلغ را وارد کنید یا رد کنید.",
-        "description": "شرح گزارش را وارد کنید. این بخش بسیار مهم است.",
+        "description": "شرح گزارش را وارد کنید. این بخش اجباری است.",
         "evidence": "عکس یا فایل‌های مدرک را ارسال کنید. اگر تمام شد، روی «پایان مدارک» بزنید.",
     }
     return prompts.get(step, "مقدار این بخش را وارد کنید.")
@@ -590,10 +556,9 @@ def admin_report_actions_keyboard(report_id: int):
 def format_report_form(state: Dict[str, Any]) -> str:
     data = state["data"]
     step = current_step(state)
-
     evidences_count = len(data["evidences"])
 
-    text = f"""
+    return f"""
 📋 <b>فرم ثبت گزارش</b>
 
 1) <b>شماره کارت:</b> {esc(data.get("card_number"))}
@@ -609,12 +574,10 @@ def format_report_form(state: Dict[str, Any]) -> str:
 <b>راهنما:</b> {esc(step_prompt(step))}
 """.strip()
 
-    return text
-
 
 def format_review(state: Dict[str, Any]) -> str:
     data = state["data"]
-    text = f"""
+    return f"""
 📋 <b>مرور نهایی گزارش</b>
 
 <b>شماره کارت:</b> {esc(data.get("card_number"))}
@@ -629,64 +592,6 @@ def format_review(state: Dict[str, Any]) -> str:
 
 اگر اطلاعات درست است، ثبت نهایی را بزنید.
 """.strip()
-    return text
-
-
-def format_report_public(report_row) -> str:
-    status_label = CASE_STATUS_LABELS.get(report_row["status"], report_row["status"])
-    similar_count = count_similar_approved(report_row)
-    risk = risk_label(similar_count, report_row["evidence_count"])
-
-    text = f"""
-📁 <b>پرونده: {esc(report_row["case_code"])}</b>
-
-<b>وضعیت:</b> {esc(status_label)}
-<b>ریسک:</b> {esc(risk)}
-<b>تعداد گزارش‌های مشابه تاییدشده:</b> {similar_count}
-
-<b>نام:</b> {esc(report_row["target_full_name"])}
-<b>شماره کارت:</b> {esc(report_row["target_card_number"])}
-<b>شماره تماس:</b> {esc(report_row["target_phone"])}
-<b>آیدی تلگرام:</b> {esc(report_row["target_telegram_id"])}
-<b>مبلغ:</b> {esc(report_row["amount"])}
-
-<b>شرح گزارش:</b>
-{esc(report_row["description"])}
-
-<b>تعداد مدارک:</b> {report_row["evidence_count"]}
-""".strip()
-    return text
-
-
-def format_report_admin(report_row) -> str:
-    status_label = CASE_STATUS_LABELS.get(report_row["status"], report_row["status"])
-    similar_count = count_similar_approved(report_row)
-    risk = risk_label(similar_count, report_row["evidence_count"])
-
-    text = f"""
-🛠 <b>پرونده ادمین</b>
-
-<b>شماره پرونده:</b> {esc(report_row["case_code"])}
-<b>شناسه داخلی:</b> {report_row["id"]}
-<b>وضعیت:</b> {esc(status_label)}
-<b>ریسک:</b> {esc(risk)}
-<b>گزارش‌دهنده:</b> <code>{report_row["reporter_user_id"]}</code>
-
-<b>نام:</b> {esc(report_row["target_full_name"])}
-<b>شماره کارت:</b> {esc(report_row["target_card_number"])}
-<b>شماره تماس:</b> {esc(report_row["target_phone"])}
-<b>آیدی تلگرام:</b> {esc(report_row["target_telegram_id"])}
-<b>مبلغ:</b> {esc(report_row["amount"])}
-
-<b>شرح گزارش:</b>
-{esc(report_row["description"])}
-
-<b>تعداد مدارک:</b> {report_row["evidence_count"]}
-<b>دلیل ادمین:</b> {esc(report_row["admin_reason"])}
-<b>ثبت:</b> {esc(report_row["created_at"])}
-<b>آخرین بروزرسانی:</b> {esc(report_row["updated_at"])}
-""".strip()
-    return text
 
 
 def risk_label(similar_count: int, evidence_count: int) -> str:
@@ -710,6 +615,61 @@ def risk_label(similar_count: int, evidence_count: int) -> str:
     elif score >= 1:
         return "🟡 کم"
     return "⚪ نامشخص"
+
+
+def format_report_public(report_row) -> str:
+    similar_count = count_similar_approved(report_row)
+    risk = risk_label(similar_count, report_row["evidence_count"])
+    status_label = CASE_STATUS_LABELS.get(report_row["status"], report_row["status"])
+
+    return f"""
+📁 <b>پرونده: {esc(report_row["case_code"])}</b>
+
+<b>وضعیت:</b> {esc(status_label)}
+<b>ریسک:</b> {esc(risk)}
+<b>تعداد گزارش‌های مشابه تاییدشده:</b> {similar_count}
+
+<b>نام:</b> {esc(report_row["target_full_name"])}
+<b>شماره کارت:</b> {esc(report_row["target_card_number"])}
+<b>شماره تماس:</b> {esc(report_row["target_phone"])}
+<b>آیدی تلگرام:</b> {esc(report_row["target_telegram_id"])}
+<b>مبلغ:</b> {esc(report_row["amount"])}
+
+<b>شرح گزارش:</b>
+{esc(report_row["description"])}
+
+<b>تعداد مدارک:</b> {report_row["evidence_count"]}
+""".strip()
+
+
+def format_report_admin(report_row) -> str:
+    similar_count = count_similar_approved(report_row)
+    risk = risk_label(similar_count, report_row["evidence_count"])
+    status_label = CASE_STATUS_LABELS.get(report_row["status"], report_row["status"])
+
+    return f"""
+🛠 <b>پرونده ادمین</b>
+
+<b>شماره پرونده:</b> {esc(report_row["case_code"])}
+<b>شناسه داخلی:</b> {report_row["id"]}
+<b>وضعیت:</b> {esc(status_label)}
+<b>ریسک:</b> {esc(risk)}
+<b>گزارش‌دهنده:</b> <code>{report_row["reporter_user_id"]}</code>
+
+<b>نام:</b> {esc(report_row["target_full_name"])}
+<b>شماره کارت:</b> {esc(report_row["target_card_number"])}
+<b>شماره تماس:</b> {esc(report_row["target_phone"])}
+<b>آیدی تلگرام:</b> {esc(report_row["target_telegram_id"])}
+<b>مبلغ:</b> {esc(report_row["amount"])}
+
+<b>شرح گزارش:</b>
+{esc(report_row["description"])}
+
+<b>تعداد مدارک:</b> {report_row["evidence_count"]}
+<b>دلیل ادمین:</b> {esc(report_row["admin_reason"])}
+<b>ثبت:</b> {esc(report_row["created_at"])}
+<b>آخرین بروزرسانی:</b> {esc(report_row["updated_at"])}
+""".strip()
 
 
 async def safe_edit_message(query, text: str, reply_markup=None):
@@ -739,8 +699,7 @@ async def send_report_evidences(chat_id: int, report_id: int, context: ContextTy
 
 
 def reset_user_state(user_id: int):
-    if user_id in USER_STATES:
-        del USER_STATES[user_id]
+    USER_STATES.pop(user_id, None)
 
 
 # =========================================================
@@ -749,17 +708,16 @@ def reset_user_state(user_id: int):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if not user or not update.message:
+        return
+
     upsert_user(user)
 
     if is_blocked(user.id):
         await update.message.reply_text("⛔ شما از استفاده از ربات مسدود شده‌اید.")
         return
 
-    text = (
-        "سلام 👋\n\n"
-        "به ربات ثبت و جستجوی گزارش خوش آمدید.\n"
-        "از منوی زیر استفاده کنید."
-    )
+    text = "سلام 👋\n\nبه ربات ثبت و جستجوی گزارش خوش آمدید.\nاز منوی زیر استفاده کنید."
 
     if is_admin(user.id):
         text += "\n\nشما به عنوان ادمین شناسایی شدید."
@@ -769,11 +727,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
     text = """
 ℹ️ راهنما
 
 📝 ثبت گزارش:
-برای ثبت گزارش، فرم را مرحله‌به‌مرحله تکمیل کنید.
+فرم را مرحله‌به‌مرحله تکمیل کنید.
 بیشتر فیلدها اختیاری هستند و می‌توانید رد کنید.
 
 🔍 جستجو:
@@ -789,11 +750,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🛠 ادمین:
 ادمین می‌تواند پرونده‌ها را بررسی، تایید، رد، حذف یا نیازمند مدرک بیشتر کند.
 """.strip()
+
     await update.message.reply_text(text, reply_markup=user_main_menu_keyboard())
 
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if not user or not update.message:
+        return
+
     upsert_user(user)
 
     if not is_admin(user.id):
@@ -826,10 +791,9 @@ async def show_review(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_
     if not state:
         return
 
-    msg_id = state["message_id"]
     await context.bot.edit_message_text(
         chat_id=chat_id,
-        message_id=msg_id,
+        message_id=state["message_id"],
         text=format_review(state),
         parse_mode=ParseMode.HTML,
         reply_markup=review_keyboard(),
@@ -837,19 +801,14 @@ async def show_review(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_
 
 
 def is_report_valid(data: Dict[str, Any]) -> bool:
-    filled = any([
-        data.get("card_number"),
-        data.get("full_name"),
-        data.get("phone"),
-        data.get("telegram_id"),
-        data.get("amount"),
-        data.get("description"),
-    ])
-    return filled
+    return bool(data.get("description"))
 
 
 async def handle_report_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if not user or not update.message:
+        return
+
     state = USER_STATES.get(user.id)
     if not state or state.get("mode") != "report":
         return
@@ -899,7 +858,6 @@ async def handle_report_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"⚠️ {error}")
         return
 
-    # حذف پیام کاربر برای خلوت ماندن چت
     try:
         await update.message.delete()
     except Exception:
@@ -908,41 +866,25 @@ async def handle_report_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if state["step_index"] < len(REPORT_STEPS) - 1:
         state["step_index"] += 1
 
-    if current_step(state) == "evidence":
-        await update.get_bot().edit_message_text(
-            chat_id=state["chat_id"],
-            message_id=state["message_id"],
-            text=format_report_form(state),
-            parse_mode=ParseMode.HTML,
-            reply_markup=report_form_keyboard("evidence"),
-        )
-    elif state["step_index"] >= len(REPORT_STEPS) - 1:
-        # اگر از description به evidence رسیدیم
-        await update.get_bot().edit_message_text(
-            chat_id=state["chat_id"],
-            message_id=state["message_id"],
-            text=format_report_form(state),
-            parse_mode=ParseMode.HTML,
-            reply_markup=report_form_keyboard(current_step(state)),
-        )
-    else:
-        await update.get_bot().edit_message_text(
-            chat_id=state["chat_id"],
-            message_id=state["message_id"],
-            text=format_report_form(state),
-            parse_mode=ParseMode.HTML,
-            reply_markup=report_form_keyboard(current_step(state)),
-        )
+    await context.bot.edit_message_text(
+        chat_id=state["chat_id"],
+        message_id=state["message_id"],
+        text=format_report_form(state),
+        parse_mode=ParseMode.HTML,
+        reply_markup=report_form_keyboard(current_step(state)),
+    )
 
 
 async def handle_report_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if not user or not update.message:
+        return
+
     state = USER_STATES.get(user.id)
     if not state or state.get("mode") != "report":
         return
 
-    step = current_step(state)
-    if step != "evidence":
+    if current_step(state) != "evidence":
         return
 
     file_id = None
@@ -970,7 +912,7 @@ async def handle_report_media(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         pass
 
-    await update.get_bot().edit_message_text(
+    await context.bot.edit_message_text(
         chat_id=state["chat_id"],
         message_id=state["message_id"],
         text=format_report_form(state),
@@ -1014,6 +956,9 @@ async def start_search_prompt(chat_id: int, user_id: int, context: ContextTypes.
 
 async def handle_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if not user or not update.message:
+        return
+
     state = USER_STATES.get(user.id)
     if not state or state.get("mode") != "search":
         return
@@ -1105,10 +1050,16 @@ async def show_blocked_users(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["⛔ <b>کاربران بلاک‌شده</b>\n"]
     for r in rows:
-        lines.append(
-            f"• <code>{r['user_id']}</code> | @{esc(r['username']) if r['username'] else '—'} | {esc(r['first_name'])}"
-        )
-    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=admin_main_menu_keyboard())
+        username = f"@{r['username']}" if r["username"] else "—"
+        first_name = r["first_name"] if r["first_name"] else "—"
+        lines.append(f"• <code>{r['user_id']}</code> | {esc(username)} | {esc(first_name)}")
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_main_menu_keyboard(),
+    )
 
 
 async def show_reporters(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -1120,10 +1071,14 @@ async def show_reporters(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=chat_id, text="👥 لیست گزارش‌دهنده‌ها:")
 
     for r in rows:
+        first_name = r["first_name"] if r["first_name"] else "—"
+        last_name = r["last_name"] if r["last_name"] else ""
+        username = f"@{r['username']}" if r["username"] else "—"
+
         txt = (
-            f"👤 <b>{esc(r['first_name'])} {esc(r['last_name'])}</b>\n"
+            f"👤 <b>{esc(first_name)} {esc(last_name)}</b>\n"
             f"ID: <code>{r['user_id']}</code>\n"
-            f"Username: @{esc(r['username']) if r['username'] else '—'}\n"
+            f"Username: {esc(username)}\n"
             f"تعداد گزارش: {r['reports_count']}\n"
             f"وضعیت بلاک: {'بله' if r['is_blocked'] else 'خیر'}"
         )
@@ -1142,7 +1097,12 @@ async def show_reporter_reports(chat_id: int, reporter_user_id: int, context: Co
         await context.bot.send_message(chat_id=chat_id, text="برای این گزارش‌دهنده پرونده‌ای ثبت نشده.")
         return
 
-    await context.bot.send_message(chat_id=chat_id, text=f"📄 پرونده‌های گزارش‌دهنده <code>{reporter_user_id}</code>:", parse_mode=ParseMode.HTML)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"📄 پرونده‌های گزارش‌دهنده <code>{reporter_user_id}</code>:",
+        parse_mode=ParseMode.HTML,
+    )
+
     for row in rows:
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📂 مشاهده پرونده", callback_data=f"admin_view_{row['id']}")]
@@ -1162,8 +1122,11 @@ async def show_reporter_reports(chat_id: int, reporter_user_id: int, context: Co
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = update.effective_user
-    upsert_user(user)
 
+    if not query or not user:
+        return
+
+    upsert_user(user)
     await query.answer()
     data = query.data
 
@@ -1171,7 +1134,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message(query, "⛔ شما از استفاده از ربات مسدود شده‌اید.")
         return
 
-    # ---------- USER MENU ----------
     if data == "menu_report":
         await start_report_flow(update.effective_chat.id, user.id, context)
         return
@@ -1181,13 +1143,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "menu_help":
-        await safe_edit_message(query, """
+        await safe_edit_message(
+            query,
+            """
 ℹ️ <b>راهنما</b>
 
 - برای ثبت گزارش از بخش «ثبت گزارش» استفاده کنید.
 - برای پیدا کردن سابقه، از بخش «جستجو» استفاده کنید.
 - فقط پرونده‌های تاییدشده در جستجوی عمومی نمایش داده می‌شوند.
-""".strip(), reply_markup=user_main_menu_keyboard())
+""".strip(),
+            reply_markup=user_main_menu_keyboard(),
+        )
         return
 
     if data == "back_main":
@@ -1198,7 +1164,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reset_user_state(user.id)
         return
 
-    # ---------- REPORT FLOW ----------
     state = USER_STATES.get(user.id)
 
     if data == "report_cancel":
@@ -1230,6 +1195,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "report_prev":
             if state["step_index"] > 0:
                 state["step_index"] -= 1
+
             await safe_edit_message(
                 query,
                 format_report_form(state),
@@ -1239,7 +1205,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data == "report_finish_evidence":
             if not is_report_valid(state["data"]):
-                await query.answer("حداقل بخشی از اطلاعات باید تکمیل شده باشد.", show_alert=True)
+                await query.answer("شرح گزارش الزامی است.", show_alert=True)
                 return
 
             await show_review(update.effective_chat.id, user.id, context)
@@ -1247,7 +1213,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data == "report_submit":
             if not is_report_valid(state["data"]):
-                await query.answer("اطلاعات پرونده کافی نیست.", show_alert=True)
+                await query.answer("شرح گزارش الزامی است.", show_alert=True)
                 return
 
             report_id = create_report(state["data"], user.id)
@@ -1268,7 +1234,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=user_main_menu_keyboard(),
             )
 
-            # اطلاع به ادمین‌ها
             for admin_id in ADMIN_IDS:
                 try:
                     await context.bot.send_message(
@@ -1282,7 +1247,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.warning(f"Could not notify admin {admin_id}: {e}")
             return
 
-    # ---------- ADMIN ----------
     if data == "admin_home":
         if not is_admin(user.id):
             return
@@ -1333,7 +1297,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_reporter_reports(update.effective_chat.id, report["reporter_user_id"], context)
         return
 
-    # وضعیت‌ها
     status_map = {
         "admin_approve_": "approved",
         "admin_reject_": "rejected",
@@ -1344,6 +1307,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for prefix, new_status in status_map.items():
         if data.startswith(prefix):
             report_id = int(data.replace(prefix, ""))
+
             reason = {
                 "approved": "توسط ادمین تایید شد",
                 "rejected": "توسط ادمین رد شد",
@@ -1357,12 +1321,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             row = get_report_by_id(report_id)
+
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=f"✅ وضعیت پرونده {row['case_code']} به «{CASE_STATUS_LABELS.get(new_status, new_status)}» تغییر کرد."
             )
 
-            # اطلاع به گزارش‌دهنده
             try:
                 await context.bot.send_message(
                     chat_id=row["reporter_user_id"],
@@ -1383,7 +1347,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# MESSAGE ROUTER
+# ROUTERS
 # =========================================================
 
 async def route_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1407,7 +1371,6 @@ async def route_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_search_text(update, context)
         return
 
-    # اگر state خاصی نبود، منو را نشان بده
     if is_admin(user.id):
         await update.message.reply_text("از منوی ادمین استفاده کنید.", reply_markup=admin_main_menu_keyboard())
     else:
@@ -1448,14 +1411,12 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("admin", admin_command))
-
     app.add_handler(CallbackQueryHandler(on_callback))
-
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, route_media))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, route_text))
 
     logger.info("Bot is running...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
