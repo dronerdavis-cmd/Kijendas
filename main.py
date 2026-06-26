@@ -183,20 +183,21 @@ def main_menu_keyboard():
 
 
 def report_keyboard(step_index: int):
-    if step_index == 0:
-        action_row = [
-            InlineKeyboardButton("⏭ رد کردن / بعدی", callback_data="report:skip"),
-        ]
-    else:
-        action_row = [
-            InlineKeyboardButton("🔙 بازگشت", callback_data="report:back"),
-            InlineKeyboardButton("⏭ رد کردن / بعدی", callback_data="report:skip"),
-        ]
+    buttons = []
+
+    if step_index > 0:
+        buttons.append(
+            InlineKeyboardButton("🔙 مرحله قبل", callback_data="report:back")
+        )
+
+    buttons.append(
+        InlineKeyboardButton("⏭ رد کردن", callback_data="report:skip")
+    )
 
     return InlineKeyboardMarkup(
         [
-            action_row,
-            [InlineKeyboardButton("❌ لغو و ریست", callback_data="report:cancel")],
+            buttons,
+            [InlineKeyboardButton("❌ لغو", callback_data="report:cancel")],
         ]
     )
 
@@ -217,30 +218,64 @@ def search_keyboard():
     )
 
 
-def get_report_progress(context: ContextTypes.DEFAULT_TYPE) -> str:
-    report = context.user_data.get("report", {})
-    if not report:
-        return ""
+def mask_value(key: str, value: str) -> str:
+    if not value or value == "ثبت نشده":
+        return "هنوز وارد نشده"
 
-    lines = ["\n\n📌 اطلاعات ثبت‌شده تا اینجا:"]
-    for step in REPORT_STEPS:
+    if key == "card":
+        digits = fa_to_en_digits(value)
+        digits_only = re.sub(r"\D", "", digits)
+        if len(digits_only) >= 8:
+            return f"{digits_only[:4]}********{digits_only[-4:]}"
+        return value
+
+    return value
+
+
+def build_progress_bar(current_step: int, total_steps: int) -> str:
+    filled = current_step
+    empty = total_steps - filled
+    return f"[{'█' * filled}{'░' * empty}] {current_step}/{total_steps}"
+
+
+def build_report_form_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    report = context.user_data.get("report", {})
+    step_index = context.user_data.get("step_index", 0)
+
+    current_step = REPORT_STEPS[step_index]
+    total_steps = len(REPORT_STEPS)
+
+    lines = [
+        "📝 ثبت گزارش جدید",
+        "",
+        f"📍 مرحله {step_index + 1} از {total_steps}",
+        build_progress_bar(step_index, total_steps),
+        "",
+        "🔹 سوال فعلی:",
+        current_step["prompt"],
+        "",
+        "📋 وضعیت فرم:",
+    ]
+
+    for idx, step in enumerate(REPORT_STEPS, start=1):
         value = report.get(step["key"])
-        if value:
-            lines.append(f"{step['title']}: {value}")
+
+        if value and value != "ثبت نشده":
+            shown_value = mask_value(step["key"], value)
+            prefix = "✅"
+        else:
+            shown_value = "هنوز وارد نشده"
+            prefix = "⬜"
+
+        if idx - 1 == step_index:
+            lines.append(f"{prefix} {idx}. {step['title']}: {shown_value} ← مرحله فعلی")
+        else:
+            lines.append(f"{prefix} {idx}. {step['title']}: {shown_value}")
+
+    lines.append("")
+    lines.append("✍️ پاسخ همین سؤال را در پیام بعدی ارسال کنید.")
 
     return "\n".join(lines)
-
-
-def get_report_prompt(context: ContextTypes.DEFAULT_TYPE) -> str:
-    step_index = context.user_data.get("step_index", 0)
-    step = REPORT_STEPS[step_index]
-    progress = get_report_progress(context)
-
-    return (
-        f"{step['prompt']}\n\n"
-        f"مرحله {step_index + 1} از {len(REPORT_STEPS)}"
-        f"{progress}"
-    )
 
 
 def build_report_summary(report: dict, risk_score: int) -> str:
@@ -341,7 +376,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update,
             context,
             "ℹ️ راهنما\n\n"
-            "از بخش «ثبت گزارش» می‌توانید اطلاعات فرد مشکوک را مرحله‌به‌مرحله ثبت کنید.\n"
+            "از بخش «ثبت گزارش» می‌توانید اطلاعات فرد موردنظر را مرحله‌به‌مرحله تکمیل کنید.\n"
+            "در فرم، همه سؤال‌ها از ابتدا نمایش داده می‌شوند و هر پاسخ در همان فرم ثبت می‌شود.\n"
             "از بخش «جستجو» می‌توانید با شماره کارت، شماره تماس، نام یا آیدی تلگرام جستجو کنید.\n\n"
             "⚠️ این ربات فقط برای ثبت گزارش کاربران است و نتیجه آن حکم قطعی یا قضایی نیست.",
             back_to_menu_keyboard(),
@@ -351,10 +387,11 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "menu:report":
         context.user_data["report"] = {}
         context.user_data["step_index"] = 0
+
         await edit_or_send_message(
             update,
             context,
-            get_report_prompt(context),
+            build_report_form_text(context),
             report_keyboard(0),
         )
         return REPORT_INPUT
@@ -377,25 +414,25 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     data = query.data
+    step_index = context.user_data.get("step_index", 0)
+    report = context.user_data.setdefault("report", {})
 
     if data == "report:cancel":
         return await show_main_menu(update, context)
-
-    step_index = context.user_data.get("step_index", 0)
 
     if data == "report:back":
         context.user_data["step_index"] = max(step_index - 1, 0)
         await edit_or_send_message(
             update,
             context,
-            get_report_prompt(context),
+            build_report_form_text(context),
             report_keyboard(context.user_data["step_index"]),
         )
         return REPORT_INPUT
 
     if data == "report:skip":
-        step = REPORT_STEPS[step_index]
-        context.user_data.setdefault("report", {})[step["key"]] = step["skip"]
+        current_step = REPORT_STEPS[step_index]
+        report[current_step["key"]] = current_step["skip"]
         return await go_to_next_report_step(update, context)
 
     return REPORT_INPUT
@@ -403,9 +440,15 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def report_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     step_index = context.user_data.get("step_index", 0)
-    step = REPORT_STEPS[step_index]
 
-    context.user_data.setdefault("report", {})[step["key"]] = update.message.text.strip()
+    if step_index >= len(REPORT_STEPS):
+        await safe_delete_user_message(update)
+        return REPORT_INPUT
+
+    step = REPORT_STEPS[step_index]
+    user_text = update.message.text.strip()
+
+    context.user_data.setdefault("report", {})[step["key"]] = user_text
 
     await safe_delete_user_message(update)
     return await go_to_next_report_step(update, context)
@@ -420,7 +463,7 @@ async def go_to_next_report_step(update: Update, context: ContextTypes.DEFAULT_T
         await edit_or_send_message(
             update,
             context,
-            get_report_prompt(context),
+            build_report_form_text(context),
             report_keyboard(next_step_index),
         )
         return REPORT_INPUT
