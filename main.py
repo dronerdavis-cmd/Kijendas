@@ -1,454 +1,953 @@
 import os
+import re
+import html
 import sqlite3
+import logging
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, Any, List
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaDocument,
+)
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
-    ContextTypes,
-    ConversationHandler,
     MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
     filters,
 )
 
-# =========================
-# Config
-# =========================
+# =========================================================
+# CONFIG
+# =========================================================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DATABASE_PATH = os.getenv("DATABASE_PATH", "database.db").strip()
 
-ADMIN_IDS = []
-for item in os.getenv("ADMIN_IDS", "").split(","):
-    item = item.strip()
-    if item.isdigit():
-        ADMIN_IDS.append(int(item))
+# آیدی ادمین‌ها را با کاما جدا کن:
+# مثال:
+# ADMIN_IDS=123456789,987654321
+ADMIN_IDS = set()
+for x in os.getenv("ADMIN_IDS", "").split(","):
+    x = x.strip()
+    if x.isdigit():
+        ADMIN_IDS.add(int(x))
 
-MENU, REPORT_INPUT, MEDIA_INPUT, SEARCH_INPUT = range(4)
+DB_PATH = os.getenv("DB_PATH", "bot.db")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+)
+logger = logging.getLogger(__name__)
+
+# =========================================================
+# STATES (manual, single-file approach)
+# =========================================================
+
+USER_STATES: Dict[int, Dict[str, Any]] = {}
 
 REPORT_STEPS = [
-    {
-        "key": "card_number",
-        "title": "شماره کارت",
-        "question": "💳 شماره کارت فرد موردنظر را وارد کنید",
-        "required": False,
-    },
-    {
-        "key": "full_name",
-        "title": "نام و نام خانوادگی",
-        "question": "👤 نام و نام خانوادگی فرد موردنظر را وارد کنید",
-        "required": True,
-    },
-    {
-        "key": "phone",
-        "title": "شماره تماس",
-        "question": "📞 شماره تماس فرد موردنظر را وارد کنید",
-        "required": False,
-    },
-    {
-        "key": "username",
-        "title": "آیدی تلگرام",
-        "question": "🆔 آیدی تلگرام فرد موردنظر را وارد کنید، مثل @username",
-        "required": False,
-    },
-    {
-        "key": "amount",
-        "title": "مبلغ",
-        "question": "💰 مبلغ یا حدود مبلغ را وارد کنید",
-        "required": False,
-    },
-    {
-        "key": "report_text",
-        "title": "شرح گزارش",
-        "question": "📝 شرح کامل گزارش را وارد کنید",
-        "required": True,
-    },
-    {
-        "key": "media",
-        "title": "مدارک",
-        "question": "📎 عکس، اسکرین‌شات، فایل یا PDF مدارک را ارسال کنید",
-        "required": False,
-    },
+    "card_number",
+    "full_name",
+    "phone",
+    "telegram_id",
+    "amount",
+    "description",
+    "evidence",
 ]
 
-STATUS_LABELS = {
-    "pending": "📥 در انتظار بررسی",
-    "approved": "✅ تایید شده",
-    "rejected": "❌ رد شده",
-    "removed": "🗑️ حذف شده",
-    "need_more": "📎 نیازمند مدرک بیشتر",
-    "disputed": "⚠️ دارای اعتراض",
+STEP_LABELS = {
+    "card_number": "شماره کارت",
+    "full_name": "نام و نام خانوادگی",
+    "phone": "شماره تماس",
+    "telegram_id": "آیدی تلگرام",
+    "amount": "مبلغ",
+    "description": "شرح گزارش",
+    "evidence": "مدارک",
 }
 
-# =========================
-# Helpers
-# =========================
-def now_text() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+CASE_STATUS_LABELS = {
+    "pending": "در انتظار بررسی",
+    "approved": "تایید شده",
+    "rejected": "رد شده",
+    "need_more": "نیازمند مدارک بیشتر",
+    "removed": "حذف شده",
+}
 
-
-def clean(value) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()
-
-
-def show(value) -> str:
-    value = clean(value)
-    return value if value else "ثبت نشده"
-
-
-def is_admin(user_id: Optional[int]) -> bool:
-    return bool(user_id and user_id in ADMIN_IDS)
-
+# =========================================================
+# DB
+# =========================================================
 
 def get_conn():
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def db_execute(query, params=()):
-    with get_conn() as conn:
-        conn.execute(query, params)
-        conn.commit()
-
-
-def db_fetchone(query, params=()):
-    with get_conn() as conn:
-        return conn.execute(query, params).fetchone()
-
-
-def db_fetchall(query, params=()):
-    with get_conn() as conn:
-        return conn.execute(query, params).fetchall()
-
-
 def init_db():
-    db_execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            last_name TEXT,
-            is_blocked INTEGER DEFAULT 0,
-            reports_count INTEGER DEFAULT 0,
-            rejected_reports_count INTEGER DEFAULT 0,
-            created_at TEXT,
-            updated_at TEXT
-        )
-        """
-    )
+    conn = get_conn()
+    cur = conn.cursor()
 
-    db_execute(
-        """
-        CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            reporter_id INTEGER,
-            reporter_username TEXT,
-            card_number TEXT,
-            full_name TEXT,
-            phone TEXT,
-            username TEXT,
-            amount TEXT,
-            report_text TEXT,
-            status TEXT DEFAULT 'pending',
-            admin_note TEXT,
-            risk_score INTEGER DEFAULT 0,
-            created_at TEXT,
-            updated_at TEXT
-        )
-        """
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        is_blocked INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
+    """)
 
-    db_execute(
-        """
-        CREATE TABLE IF NOT EXISTS report_media (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            report_id INTEGER,
-            file_id TEXT,
-            file_type TEXT,
-            file_name TEXT,
-            created_at TEXT
-        )
-        """
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        case_code TEXT UNIQUE,
+        reporter_user_id INTEGER,
+        target_card_number TEXT,
+        target_full_name TEXT,
+        target_phone TEXT,
+        target_telegram_id TEXT,
+        amount TEXT,
+        description TEXT,
+        evidence_count INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'pending',
+        admin_reason TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
+    """)
 
-    # Safe migration for old databases
-    try:
-        report_cols = [row["name"] for row in db_fetchall("PRAGMA table_info(reports)")]
-        needed_report_cols = {
-            "reporter_id": "INTEGER",
-            "reporter_username": "TEXT",
-            "card_number": "TEXT",
-            "full_name": "TEXT",
-            "phone": "TEXT",
-            "username": "TEXT",
-            "amount": "TEXT",
-            "report_text": "TEXT",
-            "status": "TEXT DEFAULT 'pending'",
-            "admin_note": "TEXT",
-            "risk_score": "INTEGER DEFAULT 0",
-            "created_at": "TEXT",
-            "updated_at": "TEXT",
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS evidences (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        report_id INTEGER,
+        file_id TEXT,
+        file_type TEXT,
+        caption TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS status_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        report_id INTEGER,
+        old_status TEXT,
+        new_status TEXT,
+        reason TEXT,
+        admin_user_id INTEGER,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def upsert_user(tg_user):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT INTO users (user_id, username, first_name, last_name)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+        username=excluded.username,
+        first_name=excluded.first_name,
+        last_name=excluded.last_name
+    """, (
+        tg_user.id,
+        tg_user.username,
+        tg_user.first_name,
+        tg_user.last_name,
+    ))
+    conn.commit()
+    conn.close()
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def is_blocked(user_id: int) -> bool:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT is_blocked FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row["is_blocked"]) if row else False
+
+
+def set_block_status(user_id: int, blocked: bool):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    UPDATE users
+    SET is_blocked = ?
+    WHERE user_id = ?
+    """, (1 if blocked else 0, user_id))
+    conn.commit()
+    conn.close()
+
+
+def create_report(data: Dict[str, Any], reporter_user_id: int) -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    INSERT INTO reports (
+        reporter_user_id,
+        target_card_number,
+        target_full_name,
+        target_phone,
+        target_telegram_id,
+        amount,
+        description,
+        evidence_count,
+        status
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+    """, (
+        reporter_user_id,
+        data.get("card_number"),
+        data.get("full_name"),
+        data.get("phone"),
+        data.get("telegram_id"),
+        data.get("amount"),
+        data.get("description"),
+        len(data.get("evidences", [])),
+    ))
+    report_id = cur.lastrowid
+
+    case_code = f"RPT-{report_id:06d}"
+    cur.execute("UPDATE reports SET case_code = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (case_code, report_id))
+
+    for ev in data.get("evidences", []):
+        cur.execute("""
+        INSERT INTO evidences (report_id, file_id, file_type, caption)
+        VALUES (?, ?, ?, ?)
+        """, (
+            report_id,
+            ev["file_id"],
+            ev["file_type"],
+            ev.get("caption"),
+        ))
+
+    cur.execute("""
+    INSERT INTO status_history (report_id, old_status, new_status, reason, admin_user_id)
+    VALUES (?, ?, ?, ?, ?)
+    """, (
+        report_id, None, "pending", "ثبت اولیه", None
+    ))
+
+    conn.commit()
+    conn.close()
+    return report_id
+
+
+def get_report_by_id(report_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM reports WHERE id = ?", (report_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_report_by_case_code(case_code: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM reports WHERE case_code = ?", (case_code,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_evidences(report_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM evidences WHERE report_id = ? ORDER BY id ASC", (report_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def update_report_status(report_id: int, new_status: str, admin_user_id: int, reason: Optional[str] = None):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT status FROM reports WHERE id = ?", (report_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return False
+
+    old_status = row["status"]
+
+    cur.execute("""
+    UPDATE reports
+    SET status = ?, admin_reason = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+    """, (new_status, reason, report_id))
+
+    cur.execute("""
+    INSERT INTO status_history (report_id, old_status, new_status, reason, admin_user_id)
+    VALUES (?, ?, ?, ?, ?)
+    """, (report_id, old_status, new_status, reason, admin_user_id))
+
+    conn.commit()
+    conn.close()
+    return True
+
+
+def list_reports_by_status(status: str, limit: int = 20):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT * FROM reports
+    WHERE status = ?
+    ORDER BY id DESC
+    LIMIT ?
+    """, (status, limit))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def search_reports(query: str, limit: int = 20):
+    q = f"%{query.strip()}%"
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT * FROM reports
+    WHERE
+        status = 'approved'
+        AND (
+            case_code LIKE ?
+            OR target_card_number LIKE ?
+            OR target_full_name LIKE ?
+            OR target_phone LIKE ?
+            OR target_telegram_id LIKE ?
+            OR amount LIKE ?
+            OR description LIKE ?
+        )
+    ORDER BY id DESC
+    LIMIT ?
+    """, (q, q, q, q, q, q, q, limit))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def search_all_reports_admin(query: str, limit: int = 20):
+    q = f"%{query.strip()}%"
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT * FROM reports
+    WHERE
+        case_code LIKE ?
+        OR target_card_number LIKE ?
+        OR target_full_name LIKE ?
+        OR target_phone LIKE ?
+        OR target_telegram_id LIKE ?
+        OR amount LIKE ?
+        OR description LIKE ?
+    ORDER BY id DESC
+    LIMIT ?
+    """, (q, q, q, q, q, q, q, limit))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def list_blocked_users(limit: int = 50):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT * FROM users
+    WHERE is_blocked = 1
+    ORDER BY user_id DESC
+    LIMIT ?
+    """, (limit,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def list_reporters(limit: int = 50):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT
+        u.user_id,
+        u.username,
+        u.first_name,
+        u.last_name,
+        u.is_blocked,
+        COUNT(r.id) AS reports_count
+    FROM users u
+    LEFT JOIN reports r ON u.user_id = r.reporter_user_id
+    GROUP BY u.user_id
+    ORDER BY reports_count DESC, u.user_id DESC
+    LIMIT ?
+    """, (limit,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_reporter_reports(user_id: int, limit: int = 20):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT * FROM reports
+    WHERE reporter_user_id = ?
+    ORDER BY id DESC
+    LIMIT ?
+    """, (user_id, limit))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def count_similar_approved(report_row) -> int:
+    if not report_row:
+        return 0
+
+    conditions = []
+    params = []
+
+    if report_row["target_card_number"]:
+        conditions.append("target_card_number = ?")
+        params.append(report_row["target_card_number"])
+    if report_row["target_phone"]:
+        conditions.append("target_phone = ?")
+        params.append(report_row["target_phone"])
+    if report_row["target_telegram_id"]:
+        conditions.append("target_telegram_id = ?")
+        params.append(report_row["target_telegram_id"])
+    if report_row["target_full_name"]:
+        conditions.append("target_full_name = ?")
+        params.append(report_row["target_full_name"])
+
+    if not conditions:
+        return 0
+
+    where_clause = " OR ".join(conditions)
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(f"""
+    SELECT COUNT(*) AS c FROM reports
+    WHERE status = 'approved' AND ({where_clause})
+    """, params)
+    row = cur.fetchone()
+    conn.close()
+    return row["c"] if row else 0
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def esc(text: Any) -> str:
+    if text is None:
+        return "—"
+    return html.escape(str(text))
+
+
+def normalize_text(text: str) -> str:
+    return text.strip()
+
+
+def validate_card_number(text: str) -> bool:
+    text = text.replace(" ", "").replace("-", "")
+    return bool(re.fullmatch(r"\d{16}", text))
+
+
+def validate_phone(text: str) -> bool:
+    text = text.strip()
+    return bool(re.fullmatch(r"(\+98|0)?9\d{9}", text))
+
+
+def validate_amount(text: str) -> bool:
+    text = text.replace(",", "").strip()
+    return bool(re.fullmatch(r"\d+", text))
+
+
+def make_report_state() -> Dict[str, Any]:
+    return {
+        "mode": "report",
+        "step_index": 0,
+        "message_id": None,
+        "chat_id": None,
+        "data": {
+            "card_number": None,
+            "full_name": None,
+            "phone": None,
+            "telegram_id": None,
+            "amount": None,
+            "description": None,
+            "evidences": [],
         }
-        for col, col_type in needed_report_cols.items():
-            if col not in report_cols:
-                db_execute(f"ALTER TABLE reports ADD COLUMN {col} {col_type}")
+    }
+
+
+def current_step(state: Dict[str, Any]) -> str:
+    return REPORT_STEPS[state["step_index"]]
+
+
+def step_prompt(step: str) -> str:
+    prompts = {
+        "card_number": "شماره کارت ۱۶ رقمی را وارد کنید یا رد کنید.",
+        "full_name": "نام و نام خانوادگی فرد را وارد کنید یا رد کنید.",
+        "phone": "شماره تماس را وارد کنید یا رد کنید.",
+        "telegram_id": "آیدی تلگرام را وارد کنید یا رد کنید. مثل: @username",
+        "amount": "مبلغ را وارد کنید یا رد کنید.",
+        "description": "شرح گزارش را وارد کنید. این بخش بسیار مهم است.",
+        "evidence": "عکس یا فایل‌های مدرک را ارسال کنید. اگر تمام شد، روی «پایان مدارک» بزنید.",
+    }
+    return prompts.get(step, "مقدار این بخش را وارد کنید.")
+
+
+def user_main_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 ثبت گزارش", callback_data="menu_report")],
+        [InlineKeyboardButton("🔍 جستجو", callback_data="menu_search")],
+        [InlineKeyboardButton("ℹ️ راهنما", callback_data="menu_help")],
+    ])
+
+
+def admin_main_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📂 در انتظار بررسی", callback_data="admin_list_pending")],
+        [InlineKeyboardButton("✅ تایید شده‌ها", callback_data="admin_list_approved")],
+        [InlineKeyboardButton("❌ رد شده‌ها", callback_data="admin_list_rejected")],
+        [InlineKeyboardButton("🟡 نیازمند مدرک بیشتر", callback_data="admin_list_need_more")],
+        [InlineKeyboardButton("🗑 حذف شده‌ها", callback_data="admin_list_removed")],
+        [InlineKeyboardButton("👥 گزارش‌دهنده‌ها", callback_data="admin_reporters")],
+        [InlineKeyboardButton("⛔ بلاک‌شده‌ها", callback_data="admin_blocked")],
+    ])
+
+
+def report_form_keyboard(step: str):
+    rows = []
+    if step != "description":
+        rows.append([InlineKeyboardButton("⏭ رد کردن", callback_data="report_skip")])
+
+    if step == "evidence":
+        rows.append([InlineKeyboardButton("✅ پایان مدارک", callback_data="report_finish_evidence")])
+
+    if step != "card_number":
+        rows.append([InlineKeyboardButton("⬅️ قبلی", callback_data="report_prev")])
+
+    rows.append([InlineKeyboardButton("❌ لغو", callback_data="report_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def review_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ ثبت نهایی", callback_data="report_submit")],
+        [InlineKeyboardButton("✏️ ویرایش از ابتدا", callback_data="report_restart")],
+        [InlineKeyboardButton("❌ لغو", callback_data="report_cancel")],
+    ])
+
+
+def search_result_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 جستجوی جدید", callback_data="menu_search")],
+        [InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main")],
+    ])
+
+
+def admin_report_actions_keyboard(report_id: int):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ تایید", callback_data=f"admin_approve_{report_id}"),
+            InlineKeyboardButton("❌ رد", callback_data=f"admin_reject_{report_id}"),
+        ],
+        [
+            InlineKeyboardButton("🟡 نیاز به مدرک", callback_data=f"admin_needmore_{report_id}"),
+            InlineKeyboardButton("🗑 حذف", callback_data=f"admin_remove_{report_id}"),
+        ],
+        [
+            InlineKeyboardButton("👤 گزارش‌دهنده", callback_data=f"admin_reporter_{report_id}"),
+        ],
+        [
+            InlineKeyboardButton("🔙 بازگشت", callback_data="admin_home"),
+        ]
+    ])
+
+
+def format_report_form(state: Dict[str, Any]) -> str:
+    data = state["data"]
+    step = current_step(state)
+
+    evidences_count = len(data["evidences"])
+
+    text = f"""
+📋 <b>فرم ثبت گزارش</b>
+
+1) <b>شماره کارت:</b> {esc(data.get("card_number"))}
+2) <b>نام و نام خانوادگی:</b> {esc(data.get("full_name"))}
+3) <b>شماره تماس:</b> {esc(data.get("phone"))}
+4) <b>آیدی تلگرام:</b> {esc(data.get("telegram_id"))}
+5) <b>مبلغ:</b> {esc(data.get("amount"))}
+6) <b>شرح گزارش:</b> {esc(data.get("description"))}
+7) <b>مدارک:</b> {evidences_count} فایل
+
+━━━━━━━━━━
+<b>مرحله فعلی:</b> {esc(STEP_LABELS[step])}
+<b>راهنما:</b> {esc(step_prompt(step))}
+""".strip()
+
+    return text
+
+
+def format_review(state: Dict[str, Any]) -> str:
+    data = state["data"]
+    text = f"""
+📋 <b>مرور نهایی گزارش</b>
+
+<b>شماره کارت:</b> {esc(data.get("card_number"))}
+<b>نام و نام خانوادگی:</b> {esc(data.get("full_name"))}
+<b>شماره تماس:</b> {esc(data.get("phone"))}
+<b>آیدی تلگرام:</b> {esc(data.get("telegram_id"))}
+<b>مبلغ:</b> {esc(data.get("amount"))}
+<b>شرح گزارش:</b>
+{esc(data.get("description"))}
+
+<b>تعداد مدارک:</b> {len(data.get("evidences", []))}
+
+اگر اطلاعات درست است، ثبت نهایی را بزنید.
+""".strip()
+    return text
+
+
+def format_report_public(report_row) -> str:
+    status_label = CASE_STATUS_LABELS.get(report_row["status"], report_row["status"])
+    similar_count = count_similar_approved(report_row)
+    risk = risk_label(similar_count, report_row["evidence_count"])
+
+    text = f"""
+📁 <b>پرونده: {esc(report_row["case_code"])}</b>
+
+<b>وضعیت:</b> {esc(status_label)}
+<b>ریسک:</b> {esc(risk)}
+<b>تعداد گزارش‌های مشابه تاییدشده:</b> {similar_count}
+
+<b>نام:</b> {esc(report_row["target_full_name"])}
+<b>شماره کارت:</b> {esc(report_row["target_card_number"])}
+<b>شماره تماس:</b> {esc(report_row["target_phone"])}
+<b>آیدی تلگرام:</b> {esc(report_row["target_telegram_id"])}
+<b>مبلغ:</b> {esc(report_row["amount"])}
+
+<b>شرح گزارش:</b>
+{esc(report_row["description"])}
+
+<b>تعداد مدارک:</b> {report_row["evidence_count"]}
+""".strip()
+    return text
+
+
+def format_report_admin(report_row) -> str:
+    status_label = CASE_STATUS_LABELS.get(report_row["status"], report_row["status"])
+    similar_count = count_similar_approved(report_row)
+    risk = risk_label(similar_count, report_row["evidence_count"])
+
+    text = f"""
+🛠 <b>پرونده ادمین</b>
+
+<b>شماره پرونده:</b> {esc(report_row["case_code"])}
+<b>شناسه داخلی:</b> {report_row["id"]}
+<b>وضعیت:</b> {esc(status_label)}
+<b>ریسک:</b> {esc(risk)}
+<b>گزارش‌دهنده:</b> <code>{report_row["reporter_user_id"]}</code>
+
+<b>نام:</b> {esc(report_row["target_full_name"])}
+<b>شماره کارت:</b> {esc(report_row["target_card_number"])}
+<b>شماره تماس:</b> {esc(report_row["target_phone"])}
+<b>آیدی تلگرام:</b> {esc(report_row["target_telegram_id"])}
+<b>مبلغ:</b> {esc(report_row["amount"])}
+
+<b>شرح گزارش:</b>
+{esc(report_row["description"])}
+
+<b>تعداد مدارک:</b> {report_row["evidence_count"]}
+<b>دلیل ادمین:</b> {esc(report_row["admin_reason"])}
+<b>ثبت:</b> {esc(report_row["created_at"])}
+<b>آخرین بروزرسانی:</b> {esc(report_row["updated_at"])}
+""".strip()
+    return text
+
+
+def risk_label(similar_count: int, evidence_count: int) -> str:
+    score = 0
+    if similar_count >= 4:
+        score += 4
+    elif similar_count >= 2:
+        score += 3
+    elif similar_count >= 1:
+        score += 1
+
+    if evidence_count >= 3:
+        score += 2
+    elif evidence_count >= 1:
+        score += 1
+
+    if score >= 5:
+        return "🔴 بالا"
+    elif score >= 3:
+        return "🟠 متوسط"
+    elif score >= 1:
+        return "🟡 کم"
+    return "⚪ نامشخص"
+
+
+async def safe_edit_message(query, text: str, reply_markup=None):
+    try:
+        await query.edit_message_text(
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+        )
     except Exception:
         pass
 
 
-def save_user(update: Update):
-    user = update.effective_user
-    if not user:
+async def send_report_evidences(chat_id: int, report_id: int, context: ContextTypes.DEFAULT_TYPE):
+    evs = get_evidences(report_id)
+    if not evs:
         return
 
-    old = db_fetchone("SELECT user_id FROM users WHERE user_id=?", (user.id,))
-    if old:
-        db_execute(
-            """
-            UPDATE users
-            SET username=?, first_name=?, last_name=?, updated_at=?
-            WHERE user_id=?
-            """,
-            (user.username or "", user.first_name or "", user.last_name or "", now_text(), user.id),
-        )
-    else:
-        db_execute(
-            """
-            INSERT INTO users
-            (user_id, username, first_name, last_name, is_blocked, reports_count, rejected_reports_count, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?)
-            """,
-            (user.id, user.username or "", user.first_name or "", user.last_name or "", now_text(), now_text()),
-        )
+    for ev in evs:
+        try:
+            if ev["file_type"] == "photo":
+                await context.bot.send_photo(chat_id=chat_id, photo=ev["file_id"], caption="📎 مدرک پرونده")
+            else:
+                await context.bot.send_document(chat_id=chat_id, document=ev["file_id"], caption="📎 مدرک پرونده")
+        except Exception as e:
+            logger.warning(f"Could not send evidence {ev['id']}: {e}")
 
 
-def user_is_blocked(user_id: int) -> bool:
-    row = db_fetchone("SELECT is_blocked FROM users WHERE user_id=?", (user_id,))
-    return bool(row and row["is_blocked"] == 1)
+def reset_user_state(user_id: int):
+    if user_id in USER_STATES:
+        del USER_STATES[user_id]
 
 
-def calculate_risk_score(report: dict, media_count: int) -> int:
-    score = 20
-    if clean(report.get("full_name")): score += 20
-    if clean(report.get("card_number")): score += 15
-    if clean(report.get("phone")): score += 10
-    if clean(report.get("username")): score += 10
-    if clean(report.get("report_text")): score += 15
-    if media_count > 0: score += 10
-    return min(score, 100)
+# =========================================================
+# COMMANDS
+# =========================================================
 
-# =========================
-# Keyboards
-# =========================
-def main_menu_keyboard(user_id: Optional[int] = None):
-    rows = [
-        [InlineKeyboardButton("📝 ثبت گزارش", callback_data="menu:report")],
-        [InlineKeyboardButton("🔍 جستجو", callback_data="menu:search")],
-        [InlineKeyboardButton("ℹ️ راهنما", callback_data="menu:help")],
-    ]
-    if is_admin(user_id):
-        rows.append([InlineKeyboardButton("👮 پنل ادمین", callback_data="admin:home")])
-    return InlineKeyboardMarkup(rows)
-
-
-def report_keyboard(step_index: int, media_count: int = 0):
-    step = REPORT_STEPS[step_index]
-    rows = [[InlineKeyboardButton(f"❓ {step['question']}", callback_data="noop")]]
-
-    if step["key"] == "media":
-        rows.append([InlineKeyboardButton(f"✅ پایان ارسال مدارک ({media_count})", callback_data="report:finish_media")])
-
-    nav = []
-    if step_index > 0:
-        nav.append(InlineKeyboardButton("🔙 قبلی", callback_data="report:back"))
-    if not step["required"]:
-        nav.append(InlineKeyboardButton("⏭️ رد کردن", callback_data="report:skip"))
-    if nav:
-        rows.append(nav)
-
-    rows.append([InlineKeyboardButton("❌ لغو", callback_data="report:cancel")])
-    return InlineKeyboardMarkup(rows)
-
-
-def admin_home_keyboard():
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📥 در انتظار بررسی", callback_data="admin:list:pending")],
-            [InlineKeyboardButton("✅ تایید شده‌ها", callback_data="admin:list:approved")],
-            [InlineKeyboardButton("❌ رد شده‌ها", callback_data="admin:list:rejected")],
-            [InlineKeyboardButton("📊 آمار", callback_data="admin:stats")],
-            [InlineKeyboardButton("🔙 بازگشت", callback_data="menu:home")],
-        ]
-    )
-
-# =========================
-# User Handlers
-# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_user(update)
     user = update.effective_user
+    upsert_user(user)
 
-    if user and user_is_blocked(user.id):
-        await update.effective_chat.send_message("🚫 دسترسی شما به ربات مسدود شده است.")
-        return ConversationHandler.END
+    if is_blocked(user.id):
+        await update.message.reply_text("⛔ شما از استفاده از ربات مسدود شده‌اید.")
+        return
 
-    context.user_data.clear()
     text = (
         "سلام 👋\n\n"
-        "به سامانه ثبت و جستجوی گزارش خوش آمدید.\n"
-        "لطفاً یکی از گزینه‌های زیر را انتخاب کنید."
+        "به ربات ثبت و جستجوی گزارش خوش آمدید.\n"
+        "از منوی زیر استفاده کنید."
     )
 
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=main_menu_keyboard(user.id if user else None))
+    if is_admin(user.id):
+        text += "\n\nشما به عنوان ادمین شناسایی شدید."
+        await update.message.reply_text(text, reply_markup=admin_main_menu_keyboard())
     else:
-        await update.effective_chat.send_message(text, reply_markup=main_menu_keyboard(user.id if user else None))
-
-    return MENU
+        await update.message.reply_text(text, reply_markup=user_main_menu_keyboard())
 
 
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    save_user(update)
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = """
+ℹ️ راهنما
 
-    data = query.data
+📝 ثبت گزارش:
+برای ثبت گزارش، فرم را مرحله‌به‌مرحله تکمیل کنید.
+بیشتر فیلدها اختیاری هستند و می‌توانید رد کنید.
+
+🔍 جستجو:
+می‌توانید با یکی از موارد زیر جستجو کنید:
+- شماره کارت
+- نام
+- شماره تماس
+- آیدی تلگرام
+- مبلغ
+- متن گزارش
+- شماره پرونده
+
+🛠 ادمین:
+ادمین می‌تواند پرونده‌ها را بررسی، تایید، رد، حذف یا نیازمند مدرک بیشتر کند.
+""".strip()
+    await update.message.reply_text(text, reply_markup=user_main_menu_keyboard())
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    upsert_user(user)
 
-    if user and user_is_blocked(user.id):
-        await query.edit_message_text("🚫 دسترسی شما به ربات مسدود شده است.")
-        return ConversationHandler.END
+    if not is_admin(user.id):
+        await update.message.reply_text("⛔ شما ادمین نیستید.")
+        return
 
-    if data == "menu:home":
-        return await start(update, context)
-
-    if data == "menu:help":
-        text = (
-            "ℹ️ راهنما\n\n"
-            "📝 ثبت گزارش: اطلاعات را مرحله‌به‌مرحله وارد کنید.\n"
-            "📎 در بخش مدارک می‌توانید عکس، اسکرین‌شات، فایل یا PDF بفرستید.\n"
-            "🔍 جستجو فقط بین گزارش‌های تایید شده انجام می‌شود.\n\n"
-            "⚠️ گزارش‌ها قبل از نمایش عمومی توسط ادمین بررسی می‌شوند."
-        )
-        await query.edit_message_text(text, reply_markup=main_menu_keyboard(user.id if user else None))
-        return MENU
-
-    if data == "menu:report":
-        context.user_data.clear()
-        context.user_data["report"] = {}
-        context.user_data["report_media"] = []
-        context.user_data["report_step"] = 0
-        await query.edit_message_text(
-            "📝 ثبت گزارش جدید\n\nلطفاً به سوال نمایش‌داده‌شده در دکمه پاسخ دهید.",
-            reply_markup=report_keyboard(0, 0),
-        )
-        return REPORT_INPUT
-
-    if data == "menu:search":
-        context.user_data.clear()
-        await query.edit_message_text(
-            "🔍 عبارت جستجو را ارسال کنید.\n\n"
-            "می‌توانید نام، شماره کارت، شماره تماس، آیدی تلگرام یا بخشی از متن گزارش را بفرستید.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="menu:home")]]),
-        )
-        return SEARCH_INPUT
-
-    return MENU
+    await update.message.reply_text("پنل ادمین:", reply_markup=admin_main_menu_keyboard())
 
 
-async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer("این دکمه فقط برای نمایش سوال است.", show_alert=False)
-    return None
+# =========================================================
+# REPORT FLOW
+# =========================================================
 
+async def start_report_flow(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    USER_STATES[user_id] = make_report_state()
+    USER_STATES[user_id]["chat_id"] = chat_id
 
-async def cancel_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("لغو شد")
-    context.user_data.clear()
-    await query.edit_message_text("❌ عملیات لغو شد.", reply_markup=main_menu_keyboard(update.effective_user.id))
-    return MENU
-
-
-async def go_previous_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    step_index = context.user_data.get("report_step", 0)
-    if step_index > 0:
-        step_index -= 1
-    context.user_data["report_step"] = step_index
-
-    await query.edit_message_text(
-        f"📝 مرحله {step_index + 1} از {len(REPORT_STEPS)}\n\n"
-        "لطفاً به سوال نمایش‌داده‌شده در دکمه پاسخ دهید.",
-        reply_markup=report_keyboard(step_index, len(context.user_data.get("report_media", []))),
+    text = format_report_form(USER_STATES[user_id])
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=report_form_keyboard(current_step(USER_STATES[user_id])),
     )
-    return MEDIA_INPUT if REPORT_STEPS[step_index]["key"] == "media" else REPORT_INPUT
+    USER_STATES[user_id]["message_id"] = msg.message_id
 
 
-async def skip_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    return await move_next(update, context, edit=True)
+async def show_review(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    state = USER_STATES.get(user_id)
+    if not state:
+        return
 
-
-async def move_next(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
-    current = context.user_data.get("report_step", 0)
-    next_index = current + 1
-
-    if next_index >= len(REPORT_STEPS):
-        return await finish_report(update, context)
-
-    context.user_data["report_step"] = next_index
-    text = (
-        f"📝 مرحله {next_index + 1} از {len(REPORT_STEPS)}\n\n"
-        "لطفاً به سوال نمایش‌داده‌شده در دکمه پاسخ دهید."
+    msg_id = state["message_id"]
+    await context.bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=msg_id,
+        text=format_review(state),
+        parse_mode=ParseMode.HTML,
+        reply_markup=review_keyboard(),
     )
-    keyboard = report_keyboard(next_index, len(context.user_data.get("report_media", [])))
 
-    if edit and update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=keyboard)
-    else:
-        await update.effective_chat.send_message(text, reply_markup=keyboard)
 
-    return MEDIA_INPUT if REPORT_STEPS[next_index]["key"] == "media" else REPORT_INPUT
+def is_report_valid(data: Dict[str, Any]) -> bool:
+    filled = any([
+        data.get("card_number"),
+        data.get("full_name"),
+        data.get("phone"),
+        data.get("telegram_id"),
+        data.get("amount"),
+        data.get("description"),
+    ])
+    return filled
 
 
 async def handle_report_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    step_index = context.user_data.get("report_step", 0)
-    step = REPORT_STEPS[step_index]
+    user = update.effective_user
+    state = USER_STATES.get(user.id)
+    if not state or state.get("mode") != "report":
+        return
 
-    if step["key"] == "media":
-        await update.message.reply_text("📎 لطفاً در این مرحله فایل، عکس یا PDF ارسال کنید یا دکمه پایان ارسال مدارک را بزنید.")
-        return MEDIA_INPUT
+    step = current_step(state)
+    text = normalize_text(update.message.text or "")
 
-    value = clean(update.message.text)
-    if step["required"] and not value:
-        await update.message.reply_text("⚠️ این مرحله اجباری است. لطفاً مقدار معتبر وارد کنید.")
-        return REPORT_INPUT
+    if step == "evidence":
+        await update.message.reply_text("در این مرحله لطفاً عکس یا فایل بفرستید، یا «پایان مدارک» را بزنید.")
+        return
 
-    context.user_data.setdefault("report", {})[step["key"]] = value
+    error = None
 
+    if step == "card_number":
+        card = text.replace(" ", "").replace("-", "")
+        if not validate_card_number(card):
+            error = "شماره کارت باید ۱۶ رقمی باشد."
+        else:
+            state["data"]["card_number"] = card
+
+    elif step == "full_name":
+        state["data"]["full_name"] = text
+
+    elif step == "phone":
+        if not validate_phone(text):
+            error = "شماره تماس معتبر نیست."
+        else:
+            state["data"]["phone"] = text
+
+    elif step == "telegram_id":
+        state["data"]["telegram_id"] = text
+
+    elif step == "amount":
+        clean_amount = text.replace(",", "")
+        if not validate_amount(clean_amount):
+            error = "مبلغ باید فقط عدد باشد."
+        else:
+            state["data"]["amount"] = clean_amount
+
+    elif step == "description":
+        if len(text) < 5:
+            error = "شرح گزارش خیلی کوتاه است."
+        else:
+            state["data"]["description"] = text
+
+    if error:
+        await update.message.reply_text(f"⚠️ {error}")
+        return
+
+    # حذف پیام کاربر برای خلوت ماندن چت
     try:
         await update.message.delete()
     except Exception:
         pass
 
-    return await move_next(update, context)
+    if state["step_index"] < len(REPORT_STEPS) - 1:
+        state["step_index"] += 1
+
+    if current_step(state) == "evidence":
+        await update.get_bot().edit_message_text(
+            chat_id=state["chat_id"],
+            message_id=state["message_id"],
+            text=format_report_form(state),
+            parse_mode=ParseMode.HTML,
+            reply_markup=report_form_keyboard("evidence"),
+        )
+    elif state["step_index"] >= len(REPORT_STEPS) - 1:
+        # اگر از description به evidence رسیدیم
+        await update.get_bot().edit_message_text(
+            chat_id=state["chat_id"],
+            message_id=state["message_id"],
+            text=format_report_form(state),
+            parse_mode=ParseMode.HTML,
+            reply_markup=report_form_keyboard(current_step(state)),
+        )
+    else:
+        await update.get_bot().edit_message_text(
+            chat_id=state["chat_id"],
+            message_id=state["message_id"],
+            text=format_report_form(state),
+            parse_mode=ParseMode.HTML,
+            reply_markup=report_form_keyboard(current_step(state)),
+        )
 
 
-async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    media_items = context.user_data.setdefault("report_media", [])
+async def handle_report_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    state = USER_STATES.get(user.id)
+    if not state or state.get("mode") != "report":
+        return
+
+    step = current_step(state)
+    if step != "evidence":
+        return
 
     file_id = None
     file_type = None
-    file_name = ""
+    caption = update.message.caption
 
     if update.message.photo:
         file_id = update.message.photo[-1].file_id
@@ -456,337 +955,508 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.message.document:
         file_id = update.message.document.file_id
         file_type = "document"
-        file_name = update.message.document.file_name or ""
-    elif update.message.video:
-        file_id = update.message.video.file_id
-        file_type = "video"
-    elif update.message.audio:
-        file_id = update.message.audio.file_id
-        file_type = "audio"
 
     if not file_id:
-        await update.message.reply_text("⚠️ فقط عکس، فایل، PDF یا اسکرین‌شات قابل دریافت است.")
-        return MEDIA_INPUT
+        return
 
-    media_items.append({"file_id": file_id, "file_type": file_type, "file_name": file_name})
+    state["data"]["evidences"].append({
+        "file_id": file_id,
+        "file_type": file_type,
+        "caption": caption,
+    })
 
     try:
         await update.message.delete()
     except Exception:
         pass
 
-    step_index = context.user_data.get("report_step", 0)
-    await update.effective_chat.send_message(
-        f"✅ مدرک دریافت شد.\nتعداد مدارک ثبت‌شده: {len(media_items)}\n\n"
-        "اگر مدرک دیگری دارید ارسال کنید؛ در غیر این صورت دکمه پایان ارسال مدارک را بزنید.",
-        reply_markup=report_keyboard(step_index, len(media_items)),
+    await update.get_bot().edit_message_text(
+        chat_id=state["chat_id"],
+        message_id=state["message_id"],
+        text=format_report_form(state),
+        parse_mode=ParseMode.HTML,
+        reply_markup=report_form_keyboard("evidence"),
     )
-    return MEDIA_INPUT
 
 
-async def finish_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        await update.callback_query.answer()
-    return await finish_report(update, context)
+# =========================================================
+# SEARCH FLOW
+# =========================================================
 
+async def start_search_prompt(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    USER_STATES[user_id] = {
+        "mode": "search",
+        "chat_id": chat_id,
+    }
 
-async def finish_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    report = context.user_data.get("report", {})
-    media_items = context.user_data.get("report_media", [])
+    text = """
+🔍 <b>جستجو</b>
 
-    if not clean(report.get("full_name")) or not clean(report.get("report_text")):
-        msg = "⚠️ گزارش ناقص است. نام و شرح گزارش اجباری هستند."
-        if update.callback_query:
-            await update.callback_query.edit_message_text(msg, reply_markup=main_menu_keyboard(user.id if user else None))
-        else:
-            await update.effective_chat.send_message(msg, reply_markup=main_menu_keyboard(user.id if user else None))
-        context.user_data.clear()
-        return MENU
+می‌توانید با یکی از موارد زیر جستجو کنید:
+- شماره کارت
+- نام و نام خانوادگی
+- شماره تماس
+- آیدی تلگرام
+- مبلغ
+- بخشی از متن گزارش
+- شماره پرونده
 
-    risk_score = calculate_risk_score(report, len(media_items))
+عبارت موردنظر را ارسال کنید.
+""".strip()
 
-    with get_conn() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO reports
-            (reporter_id, reporter_username, card_number, full_name, phone, username, amount, report_text, status, risk_score, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
-            """,
-            (
-                user.id if user else None,
-                user.username if user and user.username else "",
-                clean(report.get("card_number")),
-                clean(report.get("full_name")),
-                clean(report.get("phone")),
-                clean(report.get("username")),
-                clean(report.get("amount")),
-                clean(report.get("report_text")),
-                risk_score,
-                now_text(),
-                now_text(),
-            ),
-        )
-        report_id = cur.lastrowid
-
-        for item in media_items:
-            conn.execute(
-                """
-                INSERT INTO report_media (report_id, file_id, file_type, file_name, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (report_id, item.get("file_id"), item.get("file_type"), item.get("file_name"), now_text()),
-            )
-
-        if user:
-            conn.execute("UPDATE users SET reports_count = reports_count + 1 WHERE user_id=?", (user.id,))
-        conn.commit()
-
-    context.user_data.clear()
-    text = (
-        f"✅ گزارش شما با شماره {report_id} ثبت شد.\n\n"
-        "وضعیت فعلی: 📥 در انتظار بررسی\n"
-        "بعد از تایید ادمین، در نتایج جستجو قابل مشاهده خواهد بود."
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=search_result_keyboard(),
     )
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=main_menu_keyboard(user.id if user else None))
-    else:
-        await update.effective_chat.send_message(text, reply_markup=main_menu_keyboard(user.id if user else None))
-    return MENU
 
 
 async def handle_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    term = clean(update.message.text)
-    try: await update.message.delete()
-    except Exception: pass
+    user = update.effective_user
+    state = USER_STATES.get(user.id)
+    if not state or state.get("mode") != "search":
+        return
 
-    if not term:
-        await update.effective_chat.send_message("⚠️ لطفاً یک عبارت معتبر برای جستجو ارسال کنید.")
-        return SEARCH_INPUT
+    query = normalize_text(update.message.text or "")
+    if len(query) < 2:
+        await update.message.reply_text("عبارت جستجو خیلی کوتاه است.")
+        return
 
-    like = f"%{term}%"
-    rows = db_fetchall(
-        """
-        SELECT * FROM reports
-        WHERE status='approved'
-        AND (card_number LIKE ? OR full_name LIKE ? OR phone LIKE ? OR username LIKE ? OR amount LIKE ? OR report_text LIKE ?)
-        ORDER BY id DESC LIMIT 10
-        """,
-        (like, like, like, like, like, like),
-    )
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    results = search_reports(query, limit=10)
+
+    if not results:
+        await update.message.reply_text(
+            "❌ نتیجه‌ای در پرونده‌های تاییدشده پیدا نشد.",
+            reply_markup=search_result_keyboard(),
+        )
+        return
+
+    await update.message.reply_text(f"✅ {len(results)} نتیجه پیدا شد:")
+
+    for row in results:
+        await update.message.reply_text(
+            format_report_public(row),
+            parse_mode=ParseMode.HTML,
+            reply_markup=search_result_keyboard(),
+        )
+        await send_report_evidences(update.effective_chat.id, row["id"], context)
+
+    reset_user_state(user.id)
+
+
+# =========================================================
+# ADMIN FLOW
+# =========================================================
+
+async def show_admin_home(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(chat_id=chat_id, text="پنل ادمین:", reply_markup=admin_main_menu_keyboard())
+
+
+async def show_admin_report_list(chat_id: int, status: str, context: ContextTypes.DEFAULT_TYPE):
+    rows = list_reports_by_status(status)
 
     if not rows:
-        await update.effective_chat.send_message(
-            "🔍 نتیجه‌ای یافت نشد.\n\nفقط گزارش‌های تاییدشده نمایش داده می‌شوند.",
-            reply_markup=main_menu_keyboard(update.effective_user.id),
-        )
-        return MENU
+        await context.bot.send_message(chat_id=chat_id, text="موردی پیدا نشد.", reply_markup=admin_main_menu_keyboard())
+        return
+
+    status_label = CASE_STATUS_LABELS.get(status, status)
+    await context.bot.send_message(chat_id=chat_id, text=f"📂 لیست پرونده‌های {status_label}:")
 
     for row in rows:
-        media_count = db_fetchone("SELECT COUNT(*) AS c FROM report_media WHERE report_id=?", (row["id"],))["c"]
-        text = (
-            f"📄 گزارش شماره: {row['id']}\n"
-            f"📍 وضعیت: {STATUS_LABELS.get(row['status'], row['status'])}\n\n"
-            f"👤 نام: {show(row['full_name'])}\n"
-            f"💳 شماره کارت: {show(row['card_number'])}\n"
-            f"📞 شماره تماس: {show(row['phone'])}\n"
-            f"🆔 آیدی تلگرام: {show(row['username'])}\n"
-            f"💰 مبلغ: {show(row['amount'])}\n"
-            f"📎 تعداد مدارک: {media_count}\n\n"
-            f"📝 شرح:\n{show(row['report_text'])}"
+        txt = (
+            f"• <b>{esc(row['case_code'])}</b>\n"
+            f"نام: {esc(row['target_full_name'])}\n"
+            f"کارت: {esc(row['target_card_number'])}\n"
+            f"تماس: {esc(row['target_phone'])}\n"
+            f"مدارک: {row['evidence_count']}"
         )
-        await update.effective_chat.send_message(text)
-
-    await update.effective_chat.send_message("✅ پایان نتایج جستجو", reply_markup=main_menu_keyboard(update.effective_user.id))
-    return MENU
-
-# =========================
-# Admin Handlers
-# =========================
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_user(update)
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ شما ادمین نیستید.")
-        return MENU
-    await update.message.reply_text("👮 پنل مدیریت", reply_markup=admin_home_keyboard())
-    return MENU
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📄 مشاهده پرونده", callback_data=f"admin_view_{row['id']}")]
+        ])
+        await context.bot.send_message(chat_id=chat_id, text=txt, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ شما ادمین نیستید.")
+async def show_admin_report(chat_id: int, report_id: int, context: ContextTypes.DEFAULT_TYPE):
+    row = get_report_by_id(report_id)
+    if not row:
+        await context.bot.send_message(chat_id=chat_id, text="پرونده پیدا نشد.")
         return
-    await update.message.reply_text(get_stats_text())
 
-
-def get_stats_text() -> str:
-    total_users = db_fetchone("SELECT COUNT(*) AS c FROM users")["c"]
-    blocked_users = db_fetchone("SELECT COUNT(*) AS c FROM users WHERE is_blocked=1")["c"]
-    total_reports = db_fetchone("SELECT COUNT(*) AS c FROM reports")["c"]
-    pending = db_fetchone("SELECT COUNT(*) AS c FROM reports WHERE status='pending'")["c"]
-    approved = db_fetchone("SELECT COUNT(*) AS c FROM reports WHERE status='approved'")["c"]
-    rejected = db_fetchone("SELECT COUNT(*) AS c FROM reports WHERE status='rejected'")["c"]
-
-    return (
-        "📊 آمار سیستم\n\n"
-        f"👥 کاربران: {total_users}\n"
-        f"🚫 کاربران مسدود: {blocked_users}\n"
-        f"📝 کل گزارش‌ها: {total_reports}\n"
-        f"📥 در انتظار بررسی: {pending}\n"
-        f"✅ تایید شده: {approved}\n"
-        f"❌ رد شده: {rejected}"
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=format_report_admin(row),
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_report_actions_keyboard(report_id),
     )
+    await send_report_evidences(chat_id, report_id, context)
 
 
-async def dbpath_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    await update.message.reply_text(f"📁 DATABASE_PATH:\n{DATABASE_PATH}")
+async def show_blocked_users(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    rows = list_blocked_users()
+    if not rows:
+        await context.bot.send_message(chat_id=chat_id, text="هیچ کاربر بلاک‌شده‌ای وجود ندارد.", reply_markup=admin_main_menu_keyboard())
+        return
+
+    lines = ["⛔ <b>کاربران بلاک‌شده</b>\n"]
+    for r in rows:
+        lines.append(
+            f"• <code>{r['user_id']}</code> | @{esc(r['username']) if r['username'] else '—'} | {esc(r['first_name'])}"
+        )
+    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=admin_main_menu_keyboard())
 
 
-async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🆔 Your Telegram ID:\n{update.effective_user.id}")
+async def show_reporters(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    rows = list_reporters()
+    if not rows:
+        await context.bot.send_message(chat_id=chat_id, text="گزارش‌دهنده‌ای پیدا نشد.", reply_markup=admin_main_menu_keyboard())
+        return
+
+    await context.bot.send_message(chat_id=chat_id, text="👥 لیست گزارش‌دهنده‌ها:")
+
+    for r in rows:
+        txt = (
+            f"👤 <b>{esc(r['first_name'])} {esc(r['last_name'])}</b>\n"
+            f"ID: <code>{r['user_id']}</code>\n"
+            f"Username: @{esc(r['username']) if r['username'] else '—'}\n"
+            f"تعداد گزارش: {r['reports_count']}\n"
+            f"وضعیت بلاک: {'بله' if r['is_blocked'] else 'خیر'}"
+        )
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📄 گزارش‌ها", callback_data=f"admin_reporterlist_{r['user_id']}"),
+                InlineKeyboardButton("⛔/✅ بلاک", callback_data=f"admin_toggleblock_{r['user_id']}"),
+            ]
+        ])
+        await context.bot.send_message(chat_id=chat_id, text=txt, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
-async def resetdb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("⚠️ بله، ریست کن", callback_data="admin:reset_confirm")],
-         [InlineKeyboardButton("لغو", callback_data="admin:home")]]
-    )
-    await update.message.reply_text(
-        "⚠️ هشدار جدی\n\nبا این کار تمام گزارش‌ها و مدارک حذف می‌شوند.\nآیا مطمئن هستید؟",
-        reply_markup=keyboard,
-    )
+async def show_reporter_reports(chat_id: int, reporter_user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    rows = get_reporter_reports(reporter_user_id)
+    if not rows:
+        await context.bot.send_message(chat_id=chat_id, text="برای این گزارش‌دهنده پرونده‌ای ثبت نشده.")
+        return
+
+    await context.bot.send_message(chat_id=chat_id, text=f"📄 پرونده‌های گزارش‌دهنده <code>{reporter_user_id}</code>:", parse_mode=ParseMode.HTML)
+    for row in rows:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📂 مشاهده پرونده", callback_data=f"admin_view_{row['id']}")]
+        ])
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"{esc(row['case_code'])} | {esc(CASE_STATUS_LABELS.get(row['status'], row['status']))}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
 
 
-async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================================================
+# CALLBACKS
+# =========================================================
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    user = update.effective_user
+    upsert_user(user)
+
     await query.answer()
-    if not is_admin(update.effective_user.id): return MENU
-
     data = query.data
-    if data == "admin:home":
-        await query.edit_message_text("👮 پنل مدیریت", reply_markup=admin_home_keyboard())
-        return MENU
 
-    if data == "admin:stats":
-        await query.edit_message_text(get_stats_text(), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin:home")]]))
-        return MENU
+    if is_blocked(user.id):
+        await safe_edit_message(query, "⛔ شما از استفاده از ربات مسدود شده‌اید.")
+        return
 
-    if data == "admin:reset_confirm":
-        db_execute("DROP TABLE IF EXISTS report_media")
-        db_execute("DROP TABLE IF EXISTS reports")
-        init_db()
-        await query.edit_message_text("✅ دیتابیس گزارش‌ها ریست شد.", reply_markup=admin_home_keyboard())
-        return MENU
+    # ---------- USER MENU ----------
+    if data == "menu_report":
+        await start_report_flow(update.effective_chat.id, user.id, context)
+        return
 
-    if data.startswith("admin:list:"):
-        status = data.split(":", 2)[2]
-        rows = db_fetchall("SELECT id, full_name FROM reports WHERE status=? ORDER BY id DESC LIMIT 20", (status,))
-        if not rows:
-            await query.edit_message_text(f"گزارشی با وضعیت {STATUS_LABELS.get(status, status)} وجود ندارد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin:home")]]))
-            return MENU
-        buttons = [[InlineKeyboardButton(f"📄 #{row['id']} - {show(row['full_name'])}", callback_data=f"admin:view:{row['id']}")] for row in rows]
-        buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data="admin:home")])
-        await query.edit_message_text(f"لیست گزارش‌ها: {STATUS_LABELS.get(status, status)}", reply_markup=InlineKeyboardMarkup(buttons))
-        return MENU
+    if data == "menu_search":
+        await start_search_prompt(update.effective_chat.id, user.id, context)
+        return
 
-    if data.startswith("admin:view:"):
-        return await show_admin_report(query, int(data.split(":")[2]))
+    if data == "menu_help":
+        await safe_edit_message(query, """
+ℹ️ <b>راهنما</b>
 
-    if data.startswith("admin:set:"):
-        parts = data.split(":")
-        st, rid = parts[2], int(parts[3])
-        db_execute("UPDATE reports SET status=?, updated_at=? WHERE id=?", (st, now_text(), rid))
-        return await show_admin_report(query, rid)
+- برای ثبت گزارش از بخش «ثبت گزارش» استفاده کنید.
+- برای پیدا کردن سابقه، از بخش «جستجو» استفاده کنید.
+- فقط پرونده‌های تاییدشده در جستجوی عمومی نمایش داده می‌شوند.
+""".strip(), reply_markup=user_main_menu_keyboard())
+        return
 
-    if data.startswith("admin:block_reporter:"):
-        rid = int(data.split(":")[2])
-        row = db_fetchone("SELECT reporter_id FROM reports WHERE id=?", (rid,))
-        if row and row["reporter_id"]:
-            db_execute("UPDATE users SET is_blocked=1 WHERE user_id=?", (row["reporter_id"],))
-            await query.answer("کاربر گزارش‌دهنده مسدود شد.", show_alert=True)
-        return await show_admin_report(query, rid)
-    return MENU
+    if data == "back_main":
+        if is_admin(user.id):
+            await safe_edit_message(query, "منوی اصلی ادمین:", reply_markup=admin_main_menu_keyboard())
+        else:
+            await safe_edit_message(query, "منوی اصلی:", reply_markup=user_main_menu_keyboard())
+        reset_user_state(user.id)
+        return
+
+    # ---------- REPORT FLOW ----------
+    state = USER_STATES.get(user.id)
+
+    if data == "report_cancel":
+        reset_user_state(user.id)
+        await safe_edit_message(query, "❌ عملیات ثبت گزارش لغو شد.", reply_markup=user_main_menu_keyboard())
+        return
+
+    if data == "report_restart":
+        await start_report_flow(update.effective_chat.id, user.id, context)
+        return
+
+    if state and state.get("mode") == "report":
+        if data == "report_skip":
+            step = current_step(state)
+            if step == "description":
+                await query.answer("شرح گزارش قابل رد کردن نیست.", show_alert=True)
+                return
+
+            if state["step_index"] < len(REPORT_STEPS) - 1:
+                state["step_index"] += 1
+
+            await safe_edit_message(
+                query,
+                format_report_form(state),
+                reply_markup=report_form_keyboard(current_step(state)),
+            )
+            return
+
+        if data == "report_prev":
+            if state["step_index"] > 0:
+                state["step_index"] -= 1
+            await safe_edit_message(
+                query,
+                format_report_form(state),
+                reply_markup=report_form_keyboard(current_step(state)),
+            )
+            return
+
+        if data == "report_finish_evidence":
+            if not is_report_valid(state["data"]):
+                await query.answer("حداقل بخشی از اطلاعات باید تکمیل شده باشد.", show_alert=True)
+                return
+
+            await show_review(update.effective_chat.id, user.id, context)
+            return
+
+        if data == "report_submit":
+            if not is_report_valid(state["data"]):
+                await query.answer("اطلاعات پرونده کافی نیست.", show_alert=True)
+                return
+
+            report_id = create_report(state["data"], user.id)
+            report = get_report_by_id(report_id)
+
+            reset_user_state(user.id)
+
+            await safe_edit_message(
+                query,
+                f"""
+✅ <b>گزارش شما ثبت شد</b>
+
+<b>شماره پرونده:</b> {esc(report["case_code"])}
+<b>وضعیت:</b> {esc(CASE_STATUS_LABELS.get(report["status"], report["status"]))}
+
+این شماره را برای پیگیری نگه دارید.
+""".strip(),
+                reply_markup=user_main_menu_keyboard(),
+            )
+
+            # اطلاع به ادمین‌ها
+            for admin_id in ADMIN_IDS:
+                try:
+                    await context.bot.send_message(
+                        chat_id=admin_id,
+                        text="📥 پرونده جدید ثبت شد:\n\n" + format_report_admin(report),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=admin_report_actions_keyboard(report_id),
+                    )
+                    await send_report_evidences(admin_id, report_id, context)
+                except Exception as e:
+                    logger.warning(f"Could not notify admin {admin_id}: {e}")
+            return
+
+    # ---------- ADMIN ----------
+    if data == "admin_home":
+        if not is_admin(user.id):
+            return
+        await safe_edit_message(query, "پنل ادمین:", reply_markup=admin_main_menu_keyboard())
+        return
+
+    if not is_admin(user.id):
+        return
+
+    if data.startswith("admin_list_"):
+        status = data.replace("admin_list_", "")
+        await show_admin_report_list(update.effective_chat.id, status, context)
+        return
+
+    if data == "admin_blocked":
+        await show_blocked_users(update.effective_chat.id, context)
+        return
+
+    if data == "admin_reporters":
+        await show_reporters(update.effective_chat.id, context)
+        return
+
+    if data.startswith("admin_reporterlist_"):
+        reporter_id = int(data.split("_")[-1])
+        await show_reporter_reports(update.effective_chat.id, reporter_id, context)
+        return
+
+    if data.startswith("admin_toggleblock_"):
+        target_id = int(data.split("_")[-1])
+        blocked = is_blocked(target_id)
+        set_block_status(target_id, not blocked)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"وضعیت کاربر <code>{target_id}</code> به {'بلاک' if not blocked else 'آزاد'} تغییر کرد.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data.startswith("admin_view_"):
+        report_id = int(data.split("_")[-1])
+        await show_admin_report(update.effective_chat.id, report_id, context)
+        return
+
+    if data.startswith("admin_reporter_"):
+        report_id = int(data.split("_")[-1])
+        report = get_report_by_id(report_id)
+        if report:
+            await show_reporter_reports(update.effective_chat.id, report["reporter_user_id"], context)
+        return
+
+    # وضعیت‌ها
+    status_map = {
+        "admin_approve_": "approved",
+        "admin_reject_": "rejected",
+        "admin_needmore_": "need_more",
+        "admin_remove_": "removed",
+    }
+
+    for prefix, new_status in status_map.items():
+        if data.startswith(prefix):
+            report_id = int(data.replace(prefix, ""))
+            reason = {
+                "approved": "توسط ادمین تایید شد",
+                "rejected": "توسط ادمین رد شد",
+                "need_more": "نیازمند مدارک بیشتر",
+                "removed": "توسط ادمین حذف شد",
+            }.get(new_status)
+
+            ok = update_report_status(report_id, new_status, user.id, reason)
+            if not ok:
+                await context.bot.send_message(chat_id=update.effective_chat.id, text="خطا در بروزرسانی وضعیت.")
+                return
+
+            row = get_report_by_id(report_id)
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"✅ وضعیت پرونده {row['case_code']} به «{CASE_STATUS_LABELS.get(new_status, new_status)}» تغییر کرد."
+            )
+
+            # اطلاع به گزارش‌دهنده
+            try:
+                await context.bot.send_message(
+                    chat_id=row["reporter_user_id"],
+                    text=f"""
+📢 <b>بروزرسانی پرونده</b>
+
+<b>شماره پرونده:</b> {esc(row["case_code"])}
+<b>وضعیت جدید:</b> {esc(CASE_STATUS_LABELS.get(row["status"], row["status"]))}
+<b>توضیح:</b> {esc(row["admin_reason"])}
+""".strip(),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                logger.warning(f"Could not notify reporter {row['reporter_user_id']}: {e}")
+
+            await show_admin_report(update.effective_chat.id, report_id, context)
+            return
 
 
-async def show_admin_report(query, report_id: int):
-    row = db_fetchone("SELECT * FROM reports WHERE id=?", (report_id,))
-    if not row: return MENU
-    media_count = db_fetchone("SELECT COUNT(*) AS c FROM report_media WHERE report_id=?", (report_id,))["c"]
-    text = (
-        f"📄 جزئیات گزارش #{row['id']}\n📍 وضعیت: {STATUS_LABELS.get(row['status'], row['status'])}\n"
-        f"⭐️ امتیاز تکمیل: {row['risk_score']}\n\n👤 نام: {show(row['full_name'])}\n"
-        f"💳 شماره کارت: {show(row['card_number'])}\n📞 تماس: {show(row['phone'])}\n"
-        f"🆔 آیدی فرد: {show(row['username'])}\n💰 مبلغ: {show(row['amount'])}\n"
-        f"📎 مدارک: {media_count}\n👤 گزارش‌دهنده: {show(row['reporter_username'])} ({row['reporter_id']})\n"
-        f"🕒 ثبت: {row['created_at']}\n\n📝 شرح:\n{show(row['report_text'])}"
-    )
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ تایید", callback_data=f"admin:set:approved:{report_id}"), InlineKeyboardButton("❌ رد", callback_data=f"admin:set:rejected:{report_id}")],
-        [InlineKeyboardButton("📎 مدرک بیشتر", callback_data=f"admin:set:need_more:{report_id}"), InlineKeyboardButton("🗑️ حذف", callback_data=f"admin:set:removed:{report_id}")],
-        [InlineKeyboardButton("🚫 بلاک گزارش‌دهنده", callback_data=f"admin:block_reporter:{report_id}")],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data="admin:home")]
-    ])
-    await query.edit_message_text(text, reply_markup=keyboard)
-    return MENU
+# =========================================================
+# MESSAGE ROUTER
+# =========================================================
 
-# =========================
-# Error Handler
-# =========================
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    print(f"ERROR: {context.error}")
+async def route_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
 
-# =========================
-# Main
-# =========================
+    user = update.effective_user
+    upsert_user(user)
+
+    if is_blocked(user.id):
+        await update.message.reply_text("⛔ شما از استفاده از ربات مسدود شده‌اید.")
+        return
+
+    state = USER_STATES.get(user.id)
+
+    if state and state.get("mode") == "report":
+        await handle_report_text(update, context)
+        return
+
+    if state and state.get("mode") == "search":
+        await handle_search_text(update, context)
+        return
+
+    # اگر state خاصی نبود، منو را نشان بده
+    if is_admin(user.id):
+        await update.message.reply_text("از منوی ادمین استفاده کنید.", reply_markup=admin_main_menu_keyboard())
+    else:
+        await update.message.reply_text("از منوی اصلی استفاده کنید.", reply_markup=user_main_menu_keyboard())
+
+
+async def route_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
+
+    user = update.effective_user
+    upsert_user(user)
+
+    if is_blocked(user.id):
+        await update.message.reply_text("⛔ شما از استفاده از ربات مسدود شده‌اید.")
+        return
+
+    state = USER_STATES.get(user.id)
+    if state and state.get("mode") == "report":
+        await handle_report_media(update, context)
+        return
+
+    await update.message.reply_text("فعلاً در حالت ثبت گزارش نیستید.")
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
 def main():
-    if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN is not set.")
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN تنظیم نشده است.")
+
     init_db()
+
     app = Application.builder().token(BOT_TOKEN).build()
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            MENU: [
-                CallbackQueryHandler(noop_callback, pattern="^noop$"),
-                CallbackQueryHandler(admin_callbacks, pattern="^admin:"),
-                CallbackQueryHandler(menu_callback, pattern="^menu:"),
-                CommandHandler("admin", admin_command),
-            ],
-            REPORT_INPUT: [
-                CallbackQueryHandler(noop_callback, pattern="^noop$"),
-                CallbackQueryHandler(cancel_report, pattern="^report:cancel$"),
-                CallbackQueryHandler(go_previous_step, pattern="^report:back$"),
-                CallbackQueryHandler(skip_step, pattern="^report:skip$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_report_text),
-            ],
-            MEDIA_INPUT: [
-                CallbackQueryHandler(noop_callback, pattern="^noop$"),
-                CallbackQueryHandler(cancel_report, pattern="^report:cancel$"),
-                CallbackQueryHandler(go_previous_step, pattern="^report:back$"),
-                CallbackQueryHandler(skip_step, pattern="^report:skip$"),
-                CallbackQueryHandler(finish_media, pattern="^report:finish_media$"),
-                MessageHandler((filters.PHOTO | filters.Document.ALL | filters.VIDEO | filters.AUDIO) & ~filters.COMMAND, handle_media),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_media),
-            ],
-            SEARCH_INPUT: [
-                CallbackQueryHandler(menu_callback, pattern="^menu:home$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search_text),
-            ],
-        },
-        fallbacks=[CommandHandler("start", start)],
-        allow_reentry=True,
-    )
-    app.add_handler(conv)
-    app.add_handler(CommandHandler("myid", myid_command))
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("admin", admin_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("dbpath", dbpath_command))
-    app.add_handler(CommandHandler("resetdb", resetdb_command))
-    app.add_handler(CallbackQueryHandler(admin_callbacks, pattern="^admin:"))
-    app.add_error_handler(error_handler)
-    print("Bot started...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    app.add_handler(CallbackQueryHandler(on_callback))
+
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, route_media))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, route_text))
+
+    logger.info("Bot is running...")
+    app.run_polling()
+
 
 if __name__ == "__main__":
     main()
