@@ -1,39 +1,33 @@
 import os
-import sqlite3
+import logging
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    ConversationHandler,
-    filters,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-TOKEN = os.getenv("BOT_TOKEN")
+# تنظیمات لاگ برای دیدن خطاها در Railway
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-CARD, TEXT = range(2)
+def main():
+    # خواندن توکن از تنظیمات Railway
+    token = os.getenv("BOT_TOKEN")
+    
+    if not token:
+        print("خطا: توکن در تنظیمات Railway پیدا نشد!")
+        return
 
-conn = sqlite3.connect("database.db", check_same_thread=False)
-cursor = conn.cursor()
+    print("ربات در حال راه اندازی است...")
+    app = Application.builder().token(token).build()
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS reports (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    card_number TEXT,
-    report_text TEXT
-)
-""")
-conn.commit()
+    # دستور ساده برای تست
+    async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("سلام! ربات با موفقیت بالا آمد.")
 
+    app.add_handler(CommandHandler("start", start))
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "ربات آماده است\n\n/report ثبت گزارش\n/search جستجو"
-    )
+    # شروع به کار ربات
+    app.run_polling()
 
-
-async def report_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+if __name__ == '__main__':
+    main()
     await update.message.reply_text("شماره کارت را بفرست:")
     return CARD
 
