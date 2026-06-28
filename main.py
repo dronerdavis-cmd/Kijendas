@@ -1,6 +1,6 @@
 import sqlite3
 import logging
-from telegram import ReplyKeyboardMarkup, Update
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
 Application,
 CommandHandler,
@@ -10,8 +10,7 @@ ContextTypes,
 filters
 )
 
-TOKEN = "PUT_YOUR_BOT_TOKEN"
-
+TOKEN = "PUT_BOT_TOKEN"
 ADMIN_IDS = [123456789]
 
 logging.basicConfig(level=logging.INFO)
@@ -23,23 +22,25 @@ WAITING_INPUT,
 ADDING_CARDS,
 ADDING_EVIDENCE,
 CONFIRM_REPORT,
+SEARCH_INPUT,
 ADMIN_PANEL,
 ADMIN_PENDING,
-ADMIN_REVIEW,
-SEARCH_INPUT
+ADMIN_REVIEW
 ) = range(10)
 
 # ---------------- DATABASE ----------------
 
+def db():
+    return sqlite3.connect("bot.db")
+
 def init_db():
 
-    conn = sqlite3.connect("bot.db")
+    conn = db()
     cur = conn.cursor()
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    telegram_id INTEGER,
+    telegram_id INTEGER PRIMARY KEY,
     username TEXT
     )
     """)
@@ -61,7 +62,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS cards(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     report_id INTEGER,
-    card_number TEXT
+    card TEXT
     )
     """)
 
@@ -81,7 +82,7 @@ def init_db():
 def main_menu(user_id):
 
     kb = [
-        ["🔎 جستجو"],
+        ["🔎 جستجوی کلاهبردار"],
         ["📝 ثبت گزارش"],
         ["👤 حساب من"]
     ]
@@ -101,8 +102,8 @@ def report_keyboard(data):
         [f"{s(data.get('name'))} نام", f"{s(data.get('cards'))} شماره کارت"],
         [f"{s(data.get('telegram_id'))} آیدی تلگرام"],
         [f"{s(data.get('description'))} توضیحات"],
-        ["📎 ارسال مدرک"],
-        ["✅ ثبت نهایی"],
+        [f"{s(data.get('evidence'))} ارسال مدرک"],
+        ["✅ ثبت نهایی گزارش"],
         ["❌ لغو"]
     ]
 
@@ -110,15 +111,15 @@ def report_keyboard(data):
 
 # ---------------- START ----------------
 
-async def start(update:Update, context:ContextTypes.DEFAULT_TYPE):
+async def start(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
     user = update.effective_user
 
-    conn = sqlite3.connect("bot.db")
+    conn = db()
     cur = conn.cursor()
 
     cur.execute(
-    "INSERT INTO users(telegram_id,username) VALUES(?,?)",
+    "INSERT OR IGNORE INTO users VALUES(?,?)",
     (user.id,user.username)
     )
 
@@ -140,7 +141,7 @@ async def main_menu_handler(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
     if text == "📝 ثبت گزارش":
 
-        context.user_data["report"] = {
+        context.user_data["report"]={
             "cards":[],
             "evidence":[]
         }
@@ -152,9 +153,11 @@ async def main_menu_handler(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
         return REPORT_FORM
 
-    if text == "🔎 جستجو":
+    if text == "🔎 جستجوی کلاهبردار":
 
-        await update.message.reply_text("عبارت جستجو را ارسال کنید")
+        await update.message.reply_text(
+        "نام / کارت / آیدی را ارسال کنید"
+        )
 
         return SEARCH_INPUT
 
@@ -163,7 +166,7 @@ async def main_menu_handler(update:Update,context:ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id not in ADMIN_IDS:
             return MAIN_MENU
 
-        kb = [["📂 گزارش های در انتظار"],["⬅️ بازگشت"]]
+        kb=[["📂 گزارش‌های در انتظار"],["⬅️ بازگشت"]]
 
         await update.message.reply_text(
         "پنل مدیریت",
@@ -184,15 +187,15 @@ async def report_form(update:Update,context:ContextTypes.DEFAULT_TYPE):
     if "نام" in text:
 
         context.user_data["field"]="name"
-        await update.message.reply_text("نام را وارد کنید")
+        await update.message.reply_text("نام را ارسال کنید")
         return WAITING_INPUT
 
     if "شماره کارت" in text:
 
-        await update.message.reply_text("شماره کارت را ارسال کنید")
+        await update.message.reply_text("شماره کارت را ارسال کنید\nبرای پایان /done")
         return ADDING_CARDS
 
-    if "آیدی تلگرام" in text:
+    if "آیدی" in text:
 
         context.user_data["field"]="telegram_id"
         await update.message.reply_text("آیدی تلگرام")
@@ -204,18 +207,19 @@ async def report_form(update:Update,context:ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("شرح ماجرا")
         return WAITING_INPUT
 
-    if text == "📎 ارسال مدرک":
+    if "مدرک" in text:
 
-        await update.message.reply_text("تصویر ارسال کنید")
+        await update.message.reply_text("تصویر ارسال کنید\nپایان /done")
         return ADDING_EVIDENCE
 
-    if text == "✅ ثبت نهایی":
+    if text == "✅ ثبت نهایی گزارش":
 
         await update.message.reply_text(
-        "آیا ارسال شود؟",
+        "آیا گزارش ارسال شود؟",
         reply_markup=ReplyKeyboardMarkup(
-        [["✅ بله"],["❌ لغو"]],
-        resize_keyboard=True)
+        [["✅ بله ارسال شود"],["✏️ ویرایش گزارش"],["❌ لغو"]],
+        resize_keyboard=True
+        )
         )
 
         return CONFIRM_REPORT
@@ -226,11 +230,11 @@ async def report_form(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
     return REPORT_FORM
 
-# ---------------- INPUT FIELD ----------------
+# ---------------- FIELD INPUT ----------------
 
 async def field_input(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
-    field = context.user_data["field"]
+    field=context.user_data["field"]
     context.user_data["report"][field]=update.message.text
 
     await update.message.reply_text(
@@ -244,11 +248,20 @@ async def field_input(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
 async def add_card(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
-    card = update.message.text
+    text=update.message.text
 
-    context.user_data["report"]["cards"].append(card)
+    if text=="/done":
 
-    await update.message.reply_text("کارت ثبت شد\nکارت بعدی یا پایان")
+        await update.message.reply_text(
+        "ثبت کارت‌ها پایان یافت",
+        reply_markup=report_keyboard(context.user_data["report"])
+        )
+
+        return REPORT_FORM
+
+    context.user_data["report"]["cards"].append(text)
+
+    await update.message.reply_text("کارت ثبت شد\nکارت بعدی یا /done")
 
     return ADDING_CARDS
 
@@ -256,7 +269,16 @@ async def add_card(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
 async def add_evidence(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
-    photo = update.message.photo[-1].file_id
+    if update.message.text=="/done":
+
+        await update.message.reply_text(
+        "ارسال مدارک پایان یافت",
+        reply_markup=report_keyboard(context.user_data["report"])
+        )
+
+        return REPORT_FORM
+
+    photo=update.message.photo[-1].file_id
 
     context.user_data["report"]["evidence"].append(photo)
 
@@ -268,44 +290,86 @@ async def add_evidence(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
 async def confirm(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
-    if update.message.text == "✅ بله":
+    text=update.message.text
 
-        data = context.user_data["report"]
+    if text!="✅ بله ارسال شود":
+        return MAIN_MENU
 
-        conn = sqlite3.connect("bot.db")
-        cur = conn.cursor()
+    data=context.user_data["report"]
 
+    conn=db()
+    cur=conn.cursor()
+
+    cur.execute("""
+    INSERT INTO reports(name,telegram_id,description,reporter,status)
+    VALUES(?,?,?,?,?)
+    """,(
+    data.get("name"),
+    data.get("telegram_id"),
+    data.get("description"),
+    update.effective_user.id,
+    "pending"
+    ))
+
+    report_id=cur.lastrowid
+
+    for c in data["cards"]:
         cur.execute(
-        "INSERT INTO reports(name,telegram_id,description,reporter,status) VALUES(?,?,?,?,?)",
-        (
-        data.get("name"),
-        data.get("telegram_id"),
-        data.get("description"),
-        update.effective_user.id,
-        "pending"
-        )
+        "INSERT INTO cards(report_id,card) VALUES(?,?)",
+        (report_id,c)
         )
 
-        report_id = cur.lastrowid
+    for e in data["evidence"]:
+        cur.execute(
+        "INSERT INTO evidence(report_id,file_id) VALUES(?,?)",
+        (report_id,e)
+        )
 
-        for c in data["cards"]:
-            cur.execute(
-            "INSERT INTO cards(report_id,card_number) VALUES(?,?)",
-            (report_id,c)
-            )
+    conn.commit()
+    conn.close()
 
-        for e in data["evidence"]:
-            cur.execute(
-            "INSERT INTO evidence(report_id,file_id) VALUES(?,?)",
-            (report_id,e)
-            )
+    await update.message.reply_text(
+    "✅ گزارش شما ثبت شد و در انتظار بررسی است",
+    reply_markup=main_menu(update.effective_user.id)
+    )
 
-        conn.commit()
-        conn.close()
+    return MAIN_MENU
 
-        await update.message.reply_text("✅ گزارش ثبت شد")
+# ---------------- SEARCH ----------------
+
+async def search(update:Update,context:ContextTypes.DEFAULT_TYPE):
+
+    query=update.message.text
+
+    conn=db()
+    cur=conn.cursor()
+
+    cur.execute("""
+    SELECT reports.id,reports.name,reports.description
+    FROM reports
+    LEFT JOIN cards ON reports.id=cards.report_id
+    WHERE reports.status='approved'
+    AND (
+    reports.name LIKE ?
+    OR reports.telegram_id LIKE ?
+    OR cards.card LIKE ?
+    )
+    """,(f"%{query}%",f"%{query}%",f"%{query}%"))
+
+    rows=cur.fetchall()
+
+    if not rows:
+
+        await update.message.reply_text("موردی یافت نشد")
 
         return MAIN_MENU
+
+    msg="⚠️ این مورد قبلا گزارش شده\n\n"
+
+    for r in rows:
+        msg+=f"📄 گزارش #{r[0]}\nنام: {r[1]}\nشرح: {r[2]}\n\n"
+
+    await update.message.reply_text(msg)
 
     return MAIN_MENU
 
@@ -313,18 +377,18 @@ async def confirm(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
 async def admin_panel(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
-    if update.message.text == "📂 گزارش های در انتظار":
+    if update.message.text=="📂 گزارش‌های در انتظار":
 
-        conn = sqlite3.connect("bot.db")
-        cur = conn.cursor()
+        conn=db()
+        cur=conn.cursor()
 
         cur.execute(
         "SELECT id,name FROM reports WHERE status='pending'"
         )
 
-        rows = cur.fetchall()
+        rows=cur.fetchall()
 
-        kb = []
+        kb=[]
 
         for r in rows:
             kb.append([f"📄 #{r[0]} | {r[1]}"])
@@ -332,7 +396,7 @@ async def admin_panel(update:Update,context:ContextTypes.DEFAULT_TYPE):
         kb.append(["⬅️ بازگشت"])
 
         await update.message.reply_text(
-        "گزارش ها",
+        "گزارش‌ها",
         reply_markup=ReplyKeyboardMarkup(kb,resize_keyboard=True)
         )
 
@@ -340,69 +404,100 @@ async def admin_panel(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
     return ADMIN_PANEL
 
-# ---------------- ADMIN REVIEW ----------------
+# ---------------- ADMIN SELECT REPORT ----------------
 
 async def admin_pending(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
-    text = update.message.text
+    text=update.message.text
 
-    if text.startswith("📄"):
+    if not text.startswith("📄"):
+        return ADMIN_PENDING
 
-        report_id = int(text.split("#")[1].split("|")[0])
+    report_id=int(text.split("#")[1].split("|")[0])
 
-        context.user_data["review_id"]=report_id
+    context.user_data["review"]=report_id
 
-        conn = sqlite3.connect("bot.db")
-        cur = conn.cursor()
+    conn=db()
+    cur=conn.cursor()
 
-        cur.execute(
-        "SELECT name,description FROM reports WHERE id=?",
-        (report_id,)
-        )
+    cur.execute(
+    "SELECT name,description FROM reports WHERE id=?",
+    (report_id,)
+    )
 
-        r = cur.fetchone()
+    r=cur.fetchone()
 
-        await update.message.reply_text(
-        f"گزارش #{report_id}\n\nنام:{r[0]}\n\nشرح:{r[1]}",
-        reply_markup=ReplyKeyboardMarkup(
-        [
-        ["✅ تایید","❌ رد"],
-        ["🗑 حذف"],
-        ["⬅️ بازگشت"]
-        ],
-        resize_keyboard=True
-        )
-        )
+    cur.execute(
+    "SELECT card FROM cards WHERE report_id=?",
+    (report_id,)
+    )
 
-        return ADMIN_REVIEW
+    cards=cur.fetchall()
 
-    return ADMIN_PENDING
+    msg=f"📄 گزارش #{report_id}\n\nنام: {r[0]}\n\n"
+
+    msg+="کارت‌ها:\n"
+
+    for c in cards:
+        msg+=c[0]+"\n"
+
+    msg+=f"\nشرح:\n{r[1]}"
+
+    kb=[
+    ["✅ تایید گزارش","❌ رد گزارش"],
+    ["🗑 حذف کامل"],
+    ["🖼 مشاهده مدارک"],
+    ["⬅️ بازگشت"]
+    ]
+
+    await update.message.reply_text(
+    msg,
+    reply_markup=ReplyKeyboardMarkup(kb,resize_keyboard=True)
+    )
+
+    return ADMIN_REVIEW
+
+# ---------------- ADMIN ACTION ----------------
 
 async def admin_review(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
-    report_id = context.user_data["review_id"]
-    text = update.message.text
+    text=update.message.text
+    report_id=context.user_data["review"]
 
-    conn = sqlite3.connect("bot.db")
-    cur = conn.cursor()
+    conn=db()
+    cur=conn.cursor()
 
-    if text == "✅ تایید":
+    if text=="✅ تایید گزارش":
 
         cur.execute(
         "UPDATE reports SET status='approved' WHERE id=?",
         (report_id,)
         )
 
-    if text == "❌ رد":
+    elif text=="❌ رد گزارش":
 
         cur.execute(
         "UPDATE reports SET status='rejected' WHERE id=?",
         (report_id,)
         )
 
-    if text == "🗑 حذف":
+    elif text=="🗑 حذف کامل":
 
         cur.execute("DELETE FROM reports WHERE id=?",(report_id,))
+
+    elif text=="🖼 مشاهده مدارک":
+
+        cur.execute(
+        "SELECT file_id FROM evidence WHERE report_id=?",
+        (report_id,)
+        )
+
+        files=cur.fetchall()
+
+        for f in files:
+            await update.message.reply_photo(f[0])
+
+        return ADMIN_REVIEW
 
     conn.commit()
     conn.close()
@@ -428,9 +523,9 @@ def main():
 
     init_db()
 
-    app = Application.builder().token(TOKEN).build()
+    app=Application.builder().token(TOKEN).build()
 
-    conv = ConversationHandler(
+    conv=ConversationHandler(
 
     entry_points=[CommandHandler("start",start)],
 
@@ -453,11 +548,15 @@ def main():
     ],
 
     ADDING_EVIDENCE:[
-    MessageHandler(filters.PHOTO,add_evidence)
+    MessageHandler(filters.PHOTO | filters.TEXT,add_evidence)
     ],
 
     CONFIRM_REPORT:[
     MessageHandler(filters.TEXT,confirm)
+    ],
+
+    SEARCH_INPUT:[
+    MessageHandler(filters.TEXT,search)
     ],
 
     ADMIN_PANEL:[
@@ -480,7 +579,9 @@ def main():
 
     app.add_handler(conv)
 
+    print("Bot Started...")
+
     app.run_polling()
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
