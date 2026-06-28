@@ -1,6 +1,7 @@
 import sqlite3
+import re
 import logging
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import ReplyKeyboardMarkup, Update
 from telegram.ext import (
 Application,
 CommandHandler,
@@ -13,19 +14,22 @@ filters
 TOKEN = "PUT_BOT_TOKEN"
 ADMIN_IDS = [123456789]
 
+MAX_EVIDENCE = 10
+DAILY_LIMIT = 5
+
 logging.basicConfig(level=logging.INFO)
 
 (
 MAIN_MENU,
 REPORT_FORM,
-WAITING_INPUT,
-ADDING_CARDS,
-ADDING_EVIDENCE,
+WAIT_FIELD,
+ADD_CARD,
+ADD_EVIDENCE,
 CONFIRM_REPORT,
-SEARCH_INPUT,
+SEARCH,
 ADMIN_PANEL,
-ADMIN_PENDING,
-ADMIN_REVIEW
+ADMIN_LIST,
+ADMIN_VIEW
 ) = range(10)
 
 # ---------------- DATABASE ----------------
@@ -35,12 +39,12 @@ def db():
 
 def init_db():
 
-    conn = db()
-    cur = conn.cursor()
+    conn=db()
+    cur=conn.cursor()
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users(
-    telegram_id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
     username TEXT
     )
     """)
@@ -51,10 +55,10 @@ def init_db():
     name TEXT,
     telegram_id TEXT,
     phone TEXT,
-    amount TEXT,
     description TEXT,
     reporter INTEGER,
-    status TEXT
+    status TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
@@ -77,46 +81,52 @@ def init_db():
     conn.commit()
     conn.close()
 
+# ---------------- VALIDATION ----------------
+
+def valid_card(card):
+    return re.fullmatch(r"\d{16}",card)
+
+def valid_tg(tg):
+    return re.fullmatch(r"@?[A-Za-z0-9_]{5,32}",tg)
+
 # ---------------- KEYBOARDS ----------------
 
-def main_menu(user_id):
+def main_menu(uid):
 
-    kb = [
-        ["🔎 جستجوی کلاهبردار"],
-        ["📝 ثبت گزارش"],
-        ["👤 حساب من"]
+    kb=[
+    ["🔎 جستجو"],
+    ["📝 ثبت گزارش"],
+    ["👤 حساب من"]
     ]
 
-    if user_id in ADMIN_IDS:
+    if uid in ADMIN_IDS:
         kb.append(["🛡 پنل مدیریت"])
 
-    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+    return ReplyKeyboardMarkup(kb,resize_keyboard=True)
 
+def report_kb(data):
 
-def report_keyboard(data):
+    def s(v): return "✅" if v else "⬜"
 
-    def s(v):
-        return "✅" if v else "⬜"
-
-    kb = [
-        [f"{s(data.get('name'))} نام", f"{s(data.get('cards'))} شماره کارت"],
-        [f"{s(data.get('telegram_id'))} آیدی تلگرام"],
-        [f"{s(data.get('description'))} توضیحات"],
-        [f"{s(data.get('evidence'))} ارسال مدرک"],
-        ["✅ ثبت نهایی گزارش"],
-        ["❌ لغو"]
+    kb=[
+    [f"{s(data.get('name'))} نام",f"{s(data.get('cards'))} کارت"],
+    [f"{s(data.get('telegram'))} آیدی تلگرام"],
+    [f"{s(data.get('desc'))} توضیحات"],
+    [f"{s(data.get('evidence'))} مدرک"],
+    ["✅ ثبت نهایی"],
+    ["❌ لغو"]
     ]
 
-    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+    return ReplyKeyboardMarkup(kb,resize_keyboard=True)
 
 # ---------------- START ----------------
 
 async def start(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
-    user = update.effective_user
+    user=update.effective_user
 
-    conn = db()
-    cur = conn.cursor()
+    conn=db()
+    cur=conn.cursor()
 
     cur.execute(
     "INSERT OR IGNORE INTO users VALUES(?,?)",
@@ -137,31 +147,45 @@ async def start(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
 async def main_menu_handler(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
-    text = update.message.text
+    text=update.message.text
 
-    if text == "📝 ثبت گزارش":
+    if text=="📝 ثبت گزارش":
+
+        conn=db()
+        cur=conn.cursor()
+
+        cur.execute("""
+        SELECT COUNT(*)
+        FROM reports
+        WHERE reporter=? 
+        AND date(created_at)=date('now')
+        """,(update.effective_user.id,))
+
+        if cur.fetchone()[0]>=DAILY_LIMIT:
+
+            await update.message.reply_text("حداکثر گزارش روزانه ثبت شده")
+
+            return MAIN_MENU
 
         context.user_data["report"]={
-            "cards":[],
-            "evidence":[]
+        "cards":[],
+        "evidence":[]
         }
 
         await update.message.reply_text(
-        "فرم گزارش را تکمیل کنید",
-        reply_markup=report_keyboard(context.user_data["report"])
+        "فرم گزارش را کامل کنید",
+        reply_markup=report_kb(context.user_data["report"])
         )
 
         return REPORT_FORM
 
-    if text == "🔎 جستجوی کلاهبردار":
+    if text=="🔎 جستجو":
 
-        await update.message.reply_text(
-        "نام / کارت / آیدی را ارسال کنید"
-        )
+        await update.message.reply_text("نام یا کارت ارسال کنید")
 
-        return SEARCH_INPUT
+        return SEARCH
 
-    if text == "🛡 پنل مدیریت":
+    if text=="🛡 پنل مدیریت":
 
         if update.effective_user.id not in ADMIN_IDS:
             return MAIN_MENU
@@ -181,51 +205,49 @@ async def main_menu_handler(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
 async def report_form(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
-    text = update.message.text
-    data = context.user_data["report"]
+    text=update.message.text
+    data=context.user_data["report"]
 
     if "نام" in text:
 
         context.user_data["field"]="name"
         await update.message.reply_text("نام را ارسال کنید")
-        return WAITING_INPUT
+        return WAIT_FIELD
 
-    if "شماره کارت" in text:
+    if "کارت" in text:
 
-        await update.message.reply_text("شماره کارت را ارسال کنید\nبرای پایان /done")
-        return ADDING_CARDS
+        await update.message.reply_text("شماره کارت 16 رقمی\nپایان /done")
+        return ADD_CARD
 
     if "آیدی" in text:
 
-        context.user_data["field"]="telegram_id"
+        context.user_data["field"]="telegram"
         await update.message.reply_text("آیدی تلگرام")
-        return WAITING_INPUT
+        return WAIT_FIELD
 
     if "توضیحات" in text:
 
-        context.user_data["field"]="description"
+        context.user_data["field"]="desc"
         await update.message.reply_text("شرح ماجرا")
-        return WAITING_INPUT
+        return WAIT_FIELD
 
     if "مدرک" in text:
 
-        await update.message.reply_text("تصویر ارسال کنید\nپایان /done")
-        return ADDING_EVIDENCE
+        await update.message.reply_text("عکس ارسال کنید\nپایان /done")
+        return ADD_EVIDENCE
 
-    if text == "✅ ثبت نهایی گزارش":
+    if text=="✅ ثبت نهایی":
 
         await update.message.reply_text(
-        "آیا گزارش ارسال شود؟",
+        "آیا ارسال شود؟",
         reply_markup=ReplyKeyboardMarkup(
-        [["✅ بله ارسال شود"],["✏️ ویرایش گزارش"],["❌ لغو"]],
-        resize_keyboard=True
-        )
+        [["✅ ارسال"],["❌ لغو"]],
+        resize_keyboard=True)
         )
 
         return CONFIRM_REPORT
 
-    if text == "❌ لغو":
-
+    if text=="❌ لغو":
         return await cancel(update,context)
 
     return REPORT_FORM
@@ -239,12 +261,12 @@ async def field_input(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
     "ثبت شد",
-    reply_markup=report_keyboard(context.user_data["report"])
+    reply_markup=report_kb(context.user_data["report"])
     )
 
     return REPORT_FORM
 
-# ---------------- ADD CARD ----------------
+# ---------------- CARD ----------------
 
 async def add_card(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
@@ -253,46 +275,56 @@ async def add_card(update:Update,context:ContextTypes.DEFAULT_TYPE):
     if text=="/done":
 
         await update.message.reply_text(
-        "ثبت کارت‌ها پایان یافت",
-        reply_markup=report_keyboard(context.user_data["report"])
+        "پایان کارت‌ها",
+        reply_markup=report_kb(context.user_data["report"])
         )
 
         return REPORT_FORM
 
+    if not valid_card(text):
+
+        await update.message.reply_text("کارت معتبر نیست")
+
+        return ADD_CARD
+
     context.user_data["report"]["cards"].append(text)
 
-    await update.message.reply_text("کارت ثبت شد\nکارت بعدی یا /done")
+    await update.message.reply_text("ثبت شد")
 
-    return ADDING_CARDS
+    return ADD_CARD
 
-# ---------------- ADD EVIDENCE ----------------
+# ---------------- EVIDENCE ----------------
 
 async def add_evidence(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
     if update.message.text=="/done":
 
         await update.message.reply_text(
-        "ارسال مدارک پایان یافت",
-        reply_markup=report_keyboard(context.user_data["report"])
+        "مدارک ثبت شد",
+        reply_markup=report_kb(context.user_data["report"])
         )
 
         return REPORT_FORM
 
-    photo=update.message.photo[-1].file_id
+    if len(context.user_data["report"]["evidence"])>=MAX_EVIDENCE:
 
-    context.user_data["report"]["evidence"].append(photo)
+        await update.message.reply_text("حداکثر 10 مدرک")
 
-    await update.message.reply_text("مدرک ثبت شد")
+        return ADD_EVIDENCE
 
-    return ADDING_EVIDENCE
+    file=update.message.photo[-1].file_id
+
+    context.user_data["report"]["evidence"].append(file)
+
+    await update.message.reply_text("مدرک ذخیره شد")
+
+    return ADD_EVIDENCE
 
 # ---------------- CONFIRM ----------------
 
 async def confirm(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
-    text=update.message.text
-
-    if text!="✅ بله ارسال شود":
+    if update.message.text!="✅ ارسال":
         return MAIN_MENU
 
     data=context.user_data["report"]
@@ -305,31 +337,25 @@ async def confirm(update:Update,context:ContextTypes.DEFAULT_TYPE):
     VALUES(?,?,?,?,?)
     """,(
     data.get("name"),
-    data.get("telegram_id"),
-    data.get("description"),
+    data.get("telegram"),
+    data.get("desc"),
     update.effective_user.id,
     "pending"
     ))
 
-    report_id=cur.lastrowid
+    rid=cur.lastrowid
 
     for c in data["cards"]:
-        cur.execute(
-        "INSERT INTO cards(report_id,card) VALUES(?,?)",
-        (report_id,c)
-        )
+        cur.execute("INSERT INTO cards(report_id,card) VALUES(?,?)",(rid,c))
 
     for e in data["evidence"]:
-        cur.execute(
-        "INSERT INTO evidence(report_id,file_id) VALUES(?,?)",
-        (report_id,e)
-        )
+        cur.execute("INSERT INTO evidence(report_id,file_id) VALUES(?,?)",(rid,e))
 
     conn.commit()
     conn.close()
 
     await update.message.reply_text(
-    "✅ گزارش شما ثبت شد و در انتظار بررسی است",
+    "✅ گزارش ثبت شد",
     reply_markup=main_menu(update.effective_user.id)
     )
 
@@ -339,22 +365,22 @@ async def confirm(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
 async def search(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
-    query=update.message.text
+    q=update.message.text
 
     conn=db()
     cur=conn.cursor()
 
     cur.execute("""
-    SELECT reports.id,reports.name,reports.description
+    SELECT reports.id,name,description
     FROM reports
     LEFT JOIN cards ON reports.id=cards.report_id
-    WHERE reports.status='approved'
+    WHERE status='approved'
     AND (
-    reports.name LIKE ?
-    OR reports.telegram_id LIKE ?
+    name LIKE ?
+    OR telegram_id LIKE ?
     OR cards.card LIKE ?
     )
-    """,(f"%{query}%",f"%{query}%",f"%{query}%"))
+    """,(f"%{q}%",f"%{q}%",f"%{q}%"))
 
     rows=cur.fetchall()
 
@@ -364,16 +390,17 @@ async def search(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
         return MAIN_MENU
 
-    msg="⚠️ این مورد قبلا گزارش شده\n\n"
+    msg="⚠️ گزارش قبلی یافت شد\n\n"
 
     for r in rows:
-        msg+=f"📄 گزارش #{r[0]}\nنام: {r[1]}\nشرح: {r[2]}\n\n"
+
+        msg+=f"گزارش #{r[0]}\nنام:{r[1]}\n{r[2]}\n\n"
 
     await update.message.reply_text(msg)
 
     return MAIN_MENU
 
-# ---------------- ADMIN PANEL ----------------
+# ---------------- ADMIN ----------------
 
 async def admin_panel(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
@@ -382,16 +409,11 @@ async def admin_panel(update:Update,context:ContextTypes.DEFAULT_TYPE):
         conn=db()
         cur=conn.cursor()
 
-        cur.execute(
-        "SELECT id,name FROM reports WHERE status='pending'"
-        )
+        cur.execute("SELECT id,name FROM reports WHERE status='pending'")
 
         rows=cur.fetchall()
 
-        kb=[]
-
-        for r in rows:
-            kb.append([f"📄 #{r[0]} | {r[1]}"])
+        kb=[[f"📄 {r[0]} | {r[1]}"] for r in rows]
 
         kb.append(["⬅️ بازگشت"])
 
@@ -400,53 +422,33 @@ async def admin_panel(update:Update,context:ContextTypes.DEFAULT_TYPE):
         reply_markup=ReplyKeyboardMarkup(kb,resize_keyboard=True)
         )
 
-        return ADMIN_PENDING
+        return ADMIN_LIST
 
     return ADMIN_PANEL
 
-# ---------------- ADMIN SELECT REPORT ----------------
-
-async def admin_pending(update:Update,context:ContextTypes.DEFAULT_TYPE):
+async def admin_list(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
     text=update.message.text
 
     if not text.startswith("📄"):
-        return ADMIN_PENDING
+        return ADMIN_LIST
 
-    report_id=int(text.split("#")[1].split("|")[0])
+    rid=int(text.split()[1])
 
-    context.user_data["review"]=report_id
+    context.user_data["rid"]=rid
 
     conn=db()
     cur=conn.cursor()
 
-    cur.execute(
-    "SELECT name,description FROM reports WHERE id=?",
-    (report_id,)
-    )
-
+    cur.execute("SELECT name,description FROM reports WHERE id=?",(rid,))
     r=cur.fetchone()
 
-    cur.execute(
-    "SELECT card FROM cards WHERE report_id=?",
-    (report_id,)
-    )
-
-    cards=cur.fetchall()
-
-    msg=f"📄 گزارش #{report_id}\n\nنام: {r[0]}\n\n"
-
-    msg+="کارت‌ها:\n"
-
-    for c in cards:
-        msg+=c[0]+"\n"
-
-    msg+=f"\nشرح:\n{r[1]}"
+    msg=f"گزارش #{rid}\n\nنام:{r[0]}\n\n{r[1]}"
 
     kb=[
-    ["✅ تایید گزارش","❌ رد گزارش"],
-    ["🗑 حذف کامل"],
-    ["🖼 مشاهده مدارک"],
+    ["✅ تایید","❌ رد"],
+    ["🗑 حذف"],
+    ["🖼 مدارک"],
     ["⬅️ بازگشت"]
     ]
 
@@ -455,54 +457,39 @@ async def admin_pending(update:Update,context:ContextTypes.DEFAULT_TYPE):
     reply_markup=ReplyKeyboardMarkup(kb,resize_keyboard=True)
     )
 
-    return ADMIN_REVIEW
+    return ADMIN_VIEW
 
-# ---------------- ADMIN ACTION ----------------
+async def admin_view(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
-async def admin_review(update:Update,context:ContextTypes.DEFAULT_TYPE):
-
+    rid=context.user_data["rid"]
     text=update.message.text
-    report_id=context.user_data["review"]
 
     conn=db()
     cur=conn.cursor()
 
-    if text=="✅ تایید گزارش":
+    if text=="✅ تایید":
+        cur.execute("UPDATE reports SET status='approved' WHERE id=?",(rid,))
 
-        cur.execute(
-        "UPDATE reports SET status='approved' WHERE id=?",
-        (report_id,)
-        )
+    elif text=="❌ رد":
+        cur.execute("UPDATE reports SET status='rejected' WHERE id=?",(rid,))
 
-    elif text=="❌ رد گزارش":
+    elif text=="🗑 حذف":
+        cur.execute("DELETE FROM reports WHERE id=?",(rid,))
 
-        cur.execute(
-        "UPDATE reports SET status='rejected' WHERE id=?",
-        (report_id,)
-        )
+    elif text=="🖼 مدارک":
 
-    elif text=="🗑 حذف کامل":
+        cur.execute("SELECT file_id FROM evidence WHERE report_id=?",(rid,))
+        rows=cur.fetchall()
 
-        cur.execute("DELETE FROM reports WHERE id=?",(report_id,))
+        for r in rows:
+            await update.message.reply_photo(r[0])
 
-    elif text=="🖼 مشاهده مدارک":
-
-        cur.execute(
-        "SELECT file_id FROM evidence WHERE report_id=?",
-        (report_id,)
-        )
-
-        files=cur.fetchall()
-
-        for f in files:
-            await update.message.reply_photo(f[0])
-
-        return ADMIN_REVIEW
+        return ADMIN_VIEW
 
     conn.commit()
     conn.close()
 
-    await update.message.reply_text("عملیات انجام شد")
+    await update.message.reply_text("انجام شد")
 
     return ADMIN_PANEL
 
@@ -531,45 +518,25 @@ def main():
 
     states={
 
-    MAIN_MENU:[
-    MessageHandler(filters.TEXT,main_menu_handler)
-    ],
+    MAIN_MENU:[MessageHandler(filters.TEXT,main_menu_handler)],
 
-    REPORT_FORM:[
-    MessageHandler(filters.TEXT,report_form)
-    ],
+    REPORT_FORM:[MessageHandler(filters.TEXT,report_form)],
 
-    WAITING_INPUT:[
-    MessageHandler(filters.TEXT,field_input)
-    ],
+    WAIT_FIELD:[MessageHandler(filters.TEXT,field_input)],
 
-    ADDING_CARDS:[
-    MessageHandler(filters.TEXT,add_card)
-    ],
+    ADD_CARD:[MessageHandler(filters.TEXT,add_card)],
 
-    ADDING_EVIDENCE:[
-    MessageHandler(filters.PHOTO | filters.TEXT,add_evidence)
-    ],
+    ADD_EVIDENCE:[MessageHandler(filters.PHOTO | filters.TEXT,add_evidence)],
 
-    CONFIRM_REPORT:[
-    MessageHandler(filters.TEXT,confirm)
-    ],
+    CONFIRM_REPORT:[MessageHandler(filters.TEXT,confirm)],
 
-    SEARCH_INPUT:[
-    MessageHandler(filters.TEXT,search)
-    ],
+    SEARCH:[MessageHandler(filters.TEXT,search)],
 
-    ADMIN_PANEL:[
-    MessageHandler(filters.TEXT,admin_panel)
-    ],
+    ADMIN_PANEL:[MessageHandler(filters.TEXT,admin_panel)],
 
-    ADMIN_PENDING:[
-    MessageHandler(filters.TEXT,admin_pending)
-    ],
+    ADMIN_LIST:[MessageHandler(filters.TEXT,admin_list)],
 
-    ADMIN_REVIEW:[
-    MessageHandler(filters.TEXT,admin_review)
-    ]
+    ADMIN_VIEW:[MessageHandler(filters.TEXT,admin_view)]
 
     },
 
@@ -579,7 +546,7 @@ def main():
 
     app.add_handler(conv)
 
-    print("Bot Started...")
+    print("Bot Started")
 
     app.run_polling()
 
