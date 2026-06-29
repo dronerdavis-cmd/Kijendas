@@ -20,35 +20,43 @@ from telegram.ext import (
 )
 
 TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS","").split(",") if x]
 
 logging.basicConfig(level=logging.INFO)
 
-# ---------------- DATABASE ----------------
+
+# ================= DATABASE =================
+
+def db():
+
+    return sqlite3.connect("bot.db")
+
 
 def init_db():
-    conn = sqlite3.connect("reports.db")
-    c = conn.cursor()
+
+    conn=db()
+    c=conn.cursor()
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS reports(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        case_code TEXT,
-        user_id INTEGER,
-        name TEXT,
-        card TEXT,
-        username TEXT,
-        phone TEXT,
-        amount TEXT,
-        description TEXT,
-        created_at TEXT
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_code TEXT,
+    user_id INTEGER,
+    name TEXT,
+    card TEXT,
+    username TEXT,
+    phone TEXT,
+    amount TEXT,
+    description TEXT,
+    created_at TEXT
     )
     """)
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS photos(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        case_code TEXT,
-        file_id TEXT
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_code TEXT,
+    file_id TEXT
     )
     """)
 
@@ -56,197 +64,242 @@ def init_db():
     conn.close()
 
 
-# ---------------- KEYBOARDS ----------------
+# ================= HELPERS =================
+
+def case_code():
+
+    return "CASE-"+''.join(random.choices(string.digits,k=6))
+
+
+def show(v):
+
+    return v if v else "اطلاعات وارد نشده"
+
+
+def review_text(d):
+
+    return f"""
+📄 پیش‌نویس گزارش
+
+👤 نام: {show(d['name'])}
+
+💳 شماره کارت: {show(d['card'])}
+
+🆔 یوزرنیم: {show(d['username'])}
+
+📞 تلفن: {show(d['phone'])}
+
+💰 مبلغ کلاهبرداری: {show(d['amount'])}
+
+📝 شرح گزارش:
+{show(d['desc'])}
+
+📎 مدارک: {len(d['photos'])}
+"""
+
+
+# ================= KEYBOARDS =================
 
 def main_menu():
-    return ReplyKeyboardMarkup(
-        [["📝 ثبت گزارش جدید"]],
-        resize_keyboard=True
-    )
-
-
-def form_keyboard():
 
     return ReplyKeyboardMarkup(
         [
-            ["👤 نام", "💳 شماره کارت"],
-            ["🆔 یوزرنیم", "📞 تلفن"],
-            ["💰 مبلغ کلاهبرداری"],
-            ["📝 شرح گزارش"],
-            ["📎 ارسال مدارک"],
-            ["✅ ثبت نهایی", "❌ لغو"]
+            ["📝 ثبت گزارش"],
+            ["🔎 استعلام","👤 پنل کاربر"],
+            ["ℹ️ راهنما"]
         ],
         resize_keyboard=True
     )
 
 
-# ---------------- REVIEW TEXT ----------------
+def report_keyboard(data):
 
-def build_review(data):
+    def m(x):
 
-    return f"""
-📄 پیش‌نویس گزارش
+        return "✅ " if x else ""
 
-👤 نام: {data['name'] or '—'}
-
-💳 شماره کارت: {data['card'] or '—'}
-
-🆔 یوزرنیم تلگرام: {data['username'] or '—'}
-
-📞 شماره تلفن: {data['phone'] or '—'}
-
-💰 مبلغ کلاهبرداری: {data['amount'] or '—'}
-
-📝 شرح گزارش:
-{data['desc'] or '—'}
-
-📎 مدارک: {len(data['photos'])}
-"""
+    return ReplyKeyboardMarkup(
+        [
+            [f"{m(data['name'])}👤 نام",f"{m(data['card'])}💳 شماره کارت"],
+            [f"{m(data['username'])}🆔 یوزرنیم",f"{m(data['phone'])}📞 تلفن"],
+            [f"{m(data['amount'])}💰 مبلغ کلاهبرداری"],
+            [f"{m(data['desc'])}📝 شرح گزارش"],
+            [f"{'✅ ' if data['photos'] else ''}📎 ارسال مدارک"],
+            ["✅ ثبت نهایی","❌ لغو"]
+        ],
+        resize_keyboard=True
+    )
 
 
-# ---------------- START ----------------
+def search_keyboard():
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return ReplyKeyboardMarkup(
+        [
+            ["💳 شماره کارت","📞 تلفن"],
+            ["👤 نام","🆔 یوزرنیم"],
+            ["🔙 بازگشت"]
+        ],
+        resize_keyboard=True
+    )
+
+
+def help_keyboard():
+
+    return ReplyKeyboardMarkup(
+        [
+            ["📘 آموزش استفاده"],
+            ["📩 ارتباط با ادمین"],
+            ["🔙 بازگشت"]
+        ],
+        resize_keyboard=True
+    )
+
+
+# ================= START =================
+
+async def start(update:Update,context:ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
-        "به ربات گزارش کلاهبرداری خوش آمدید.",
+        "به سامانه گزارش کلاهبرداری خوش آمدید",
         reply_markup=main_menu()
     )
 
 
-# ---------------- START REPORT ----------------
+# ================= REPORT =================
 
-async def start_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_report(update,context):
 
-    context.user_data["report"] = {
-        "name": None,
-        "card": None,
-        "username": None,
-        "phone": None,
-        "amount": None,
-        "desc": None,
-        "photos": []
+    context.user_data["report"]={
+        "name":None,
+        "card":None,
+        "username":None,
+        "phone":None,
+        "amount":None,
+        "desc":None,
+        "photos":[]
     }
 
-    context.user_data["waiting_for"] = None
-
-    review = await update.message.reply_text(
-        build_review(context.user_data["report"])
+    review=await update.message.reply_text(
+        review_text(context.user_data["report"])
     )
 
-    context.user_data["review_msg_id"] = review.message_id
+    context.user_data["review"]=review.message_id
 
     await update.message.reply_text(
-        "یکی از بخش‌های گزارش را انتخاب کنید:",
-        reply_markup=form_keyboard()
+        "بخش مورد نظر را انتخاب کنید",
+        reply_markup=report_keyboard(context.user_data["report"])
     )
 
 
-# ---------------- FIELD SELECTION ----------------
+# انتخاب فیلد
 
-async def choose_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def choose_field(update,context):
 
-    text = update.message.text
+    msg=update.message.text
 
-    mapping = {
-        "👤 نام": ("name", "نام کامل متهم را وارد کنید"),
-        "💳 شماره کارت": ("card", "شماره کارت ۱۶ رقمی را وارد کنید"),
-        "🆔 یوزرنیم": ("username", "یوزرنیم تلگرام را وارد کنید"),
-        "📞 تلفن": ("phone", "شماره تلفن را وارد کنید"),
-        "💰 مبلغ کلاهبرداری": ("amount", "مبلغ کلاهبرداری را وارد کنید"),
-        "📝 شرح گزارش": ("desc", "شرح کامل کلاهبرداری را بنویسید"),
+    try:
+        await update.message.delete()
+    except:
+        pass
+
+    mapping={
+        "👤 نام":("name","نام کامل را وارد کنید"),
+        "💳 شماره کارت":("card","شماره کارت ۱۶ رقمی را وارد کنید"),
+        "🆔 یوزرنیم":("username","یوزرنیم تلگرام را وارد کنید"),
+        "📞 تلفن":("phone","شماره تلفن را وارد کنید"),
+        "💰 مبلغ کلاهبرداری":("amount","مبلغ را وارد کنید"),
+        "📝 شرح گزارش":("desc","شرح کامل را بنویسید")
     }
 
-    if text not in mapping:
+    for k in mapping:
+
+        if k in msg:
+
+            field,question=mapping[k]
+
+            p=await context.bot.send_message(
+                update.effective_chat.id,
+                question
+            )
+
+            context.user_data["waiting"]=field
+            context.user_data["prompt"]=p.message_id
+
+
+# دریافت مقدار
+
+async def receive_value(update,context):
+
+    if "waiting" not in context.user_data:
         return
 
-    field, question = mapping[text]
+    field=context.user_data["waiting"]
 
-    prompt = await update.message.reply_text(question)
+    context.user_data["report"][field]=update.message.text
 
-    context.user_data["waiting_for"] = field
-    context.user_data["prompt_msg_id"] = prompt.message_id
-
-
-# ---------------- RECEIVE VALUE ----------------
-
-async def receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if not context.user_data.get("waiting_for"):
-        return
-
-    field = context.user_data["waiting_for"]
-
-    context.user_data["report"][field] = update.message.text
-
-    # delete user message
     await update.message.delete()
 
-    # delete question
     try:
         await context.bot.delete_message(
             update.effective_chat.id,
-            context.user_data["prompt_msg_id"]
+            context.user_data["prompt"]
         )
     except:
         pass
 
-    # update review
     await context.bot.edit_message_text(
-        build_review(context.user_data["report"]),
+        review_text(context.user_data["report"]),
         update.effective_chat.id,
-        context.user_data["review_msg_id"]
+        context.user_data["review"]
     )
 
-    context.user_data["waiting_for"] = None
+    await context.bot.send_message(
+        update.effective_chat.id,
+        "ادامه فرم:",
+        reply_markup=report_keyboard(context.user_data["report"])
+    )
+
+    context.user_data["waiting"]=None
 
 
-# ---------------- PHOTOS ----------------
+# دریافت عکس
 
-async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def receive_photo(update,context):
 
-    if update.message.photo is None:
+    if "report" not in context.user_data:
         return
 
-    photo_id = update.message.photo[-1].file_id
+    fid=update.message.photo[-1].file_id
 
-    context.user_data["report"]["photos"].append(photo_id)
+    context.user_data["report"]["photos"].append(fid)
 
     await update.message.delete()
 
     await context.bot.edit_message_text(
-        build_review(context.user_data["report"]),
+        review_text(context.user_data["report"]),
         update.effective_chat.id,
-        context.user_data["review_msg_id"]
+        context.user_data["review"]
     )
 
 
-# ---------------- FINALIZE ----------------
+# ثبت نهایی
 
-def generate_case():
+async def finalize(update,context):
 
-    return "CASE-" + "".join(random.choices(string.digits, k=6))
+    data=context.user_data["report"]
 
+    code=case_code()
 
-async def finalize(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    data = context.user_data["report"]
-
-    if not data["card"] or not data["desc"]:
-        await update.message.reply_text("حداقل شماره کارت و شرح گزارش باید ثبت شود.")
-        return
-
-    case_code = generate_case()
-
-    conn = sqlite3.connect("reports.db")
-    c = conn.cursor()
+    conn=db()
+    c=conn.cursor()
 
     c.execute("""
     INSERT INTO reports
     (case_code,user_id,name,card,username,phone,amount,description,created_at)
     VALUES (?,?,?,?,?,?,?,?,?)
-    """, (
-        case_code,
+    """,
+    (
+        code,
         update.effective_user.id,
         data["name"],
         data["card"],
@@ -258,126 +311,207 @@ async def finalize(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ))
 
     for p in data["photos"]:
+
         c.execute(
-            "INSERT INTO photos (case_code,file_id) VALUES (?,?)",
-            (case_code, p)
+            "INSERT INTO photos(case_code,file_id) VALUES (?,?)",
+            (code,p)
         )
 
     conn.commit()
     conn.close()
 
-    final_text = f"""
+    text=f"""
 ✅ گزارش ثبت شد
 
 شماره پرونده:
-{case_code}
+`{code}`
 
-👤 نام: {data['name']}
-💳 کارت: {data['card']}
-🆔 یوزرنیم: {data['username']}
-📞 تلفن: {data['phone']}
-💰 مبلغ: {data['amount']}
+👤 نام: {show(data['name'])}
+💳 کارت: {show(data['card'])}
+🆔 یوزرنیم: {show(data['username'])}
+📞 تلفن: {show(data['phone'])}
+💰 مبلغ: {show(data['amount'])}
 
 📝 شرح:
-{data['desc']}
+{show(data['desc'])}
 """
 
     await context.bot.delete_message(
         update.effective_chat.id,
-        context.user_data["review_msg_id"]
+        context.user_data["review"]
     )
 
     if data["photos"]:
 
-        media = []
-
-        media.append(
-            InputMediaPhoto(
-                data["photos"][0],
-                caption=final_text
-            )
-        )
+        media=[InputMediaPhoto(data["photos"][0],caption=text,parse_mode="Markdown")]
 
         for p in data["photos"][1:10]:
+
             media.append(InputMediaPhoto(p))
 
-        await context.bot.send_media_group(
-            update.effective_chat.id,
-            media
-        )
+        await context.bot.send_media_group(update.effective_chat.id,media)
 
     else:
 
-        await update.message.reply_text(final_text)
+        await update.message.reply_text(text,parse_mode="Markdown")
 
     await update.message.reply_text(
-        "گزارش شما با موفقیت ثبت شد.",
+        "گزارش با موفقیت ثبت شد",
         reply_markup=main_menu()
     )
 
 
-# ---------------- CANCEL ----------------
+# ================= SEARCH =================
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    try:
-        await context.bot.delete_message(
-            update.effective_chat.id,
-            context.user_data["review_msg_id"]
-        )
-    except:
-        pass
-
-    context.user_data.clear()
+async def start_search(update,context):
 
     await update.message.reply_text(
-        "گزارش لغو شد.",
-        reply_markup=main_menu()
+        "روش استعلام را انتخاب کنید",
+        reply_markup=search_keyboard()
     )
 
 
-# ---------------- MAIN ----------------
+async def do_search(update,context):
+
+    field_map={
+        "💳 شماره کارت":"card",
+        "📞 تلفن":"phone",
+        "👤 نام":"name",
+        "🆔 یوزرنیم":"username"
+    }
+
+    msg=update.message.text
+
+    if msg not in field_map:
+        return
+
+    context.user_data["search_field"]=field_map[msg]
+
+    await update.message.reply_text("مقدار را وارد کنید")
+
+
+async def search_value(update,context):
+
+    if "search_field" not in context.user_data:
+        return
+
+    val=update.message.text
+
+    conn=db()
+    c=conn.cursor()
+
+    c.execute(
+        f"SELECT * FROM reports WHERE {context.user_data['search_field']}=?",
+        (val,)
+    )
+
+    rows=c.fetchall()
+
+    if not rows:
+
+        await update.message.reply_text("گزارشی یافت نشد")
+        return
+
+    total=len(rows)
+
+    sum_amount=0
+
+    for r in rows:
+
+        try:
+            sum_amount+=int(r[7])
+        except:
+            pass
+
+    if total==1:
+        risk="کم"
+    elif total<=3:
+        risk="متوسط"
+    else:
+        risk="بالا"
+
+    await update.message.reply_text(
+        f"""
+⚠️ نتیجه استعلام
+
+تعداد گزارش‌ها: {total}
+
+مجموع مبالغ گزارش شده:
+{sum_amount}
+
+سطح ریسک:
+{risk}
+"""
+    )
+
+
+# ================= USER PANEL =================
+
+async def user_panel(update,context):
+
+    uid=update.effective_user.id
+
+    conn=db()
+    c=conn.cursor()
+
+    c.execute("SELECT case_code FROM reports WHERE user_id=?",(uid,))
+
+    rows=c.fetchall()
+
+    if not rows:
+
+        await update.message.reply_text("گزارشی ندارید")
+        return
+
+    txt="گزارش‌های شما:\n\n"
+
+    for r in rows:
+
+        txt+=r[0]+"\n"
+
+    await update.message.reply_text(txt)
+
+
+# ================= HELP =================
+
+async def help_menu(update,context):
+
+    await update.message.reply_text(
+        "بخش راهنما",
+        reply_markup=help_keyboard()
+    )
+
+
+# ================= MAIN =================
 
 def main():
 
     init_db()
 
-    app = Application.builder().token(TOKEN).build()
+    app=Application.builder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start",start))
 
-    app.add_handler(MessageHandler(
-        filters.Regex("^📝 ثبت گزارش جدید$"),
-        start_report
-    ))
+    app.add_handler(MessageHandler(filters.Regex("^📝 ثبت گزارش$"),start_report))
 
-    app.add_handler(MessageHandler(
-        filters.Regex("^(👤 نام|💳 شماره کارت|🆔 یوزرنیم|📞 تلفن|💰 مبلغ کلاهبرداری|📝 شرح گزارش)$"),
-        choose_field
-    ))
+    app.add_handler(MessageHandler(filters.Regex("^(👤 نام|💳 شماره کارت|🆔 یوزرنیم|📞 تلفن|💰 مبلغ کلاهبرداری|📝 شرح گزارش)"),choose_field))
 
-    app.add_handler(MessageHandler(
-        filters.Regex("^✅ ثبت نهایی$"),
-        finalize
-    ))
+    app.add_handler(MessageHandler(filters.Regex("^✅ ثبت نهایی$"),finalize))
 
-    app.add_handler(MessageHandler(
-        filters.Regex("^❌ لغو$"),
-        cancel
-    ))
+    app.add_handler(MessageHandler(filters.Regex("^🔎 استعلام$"),start_search))
 
-    app.add_handler(MessageHandler(
-        filters.PHOTO,
-        receive_photo
-    ))
+    app.add_handler(MessageHandler(filters.Regex("^(💳 شماره کارت|📞 تلفن|👤 نام|🆔 یوزرنیم)$"),do_search))
 
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        receive_value
-    ))
+    app.add_handler(MessageHandler(filters.Regex("^👤 پنل کاربر$"),user_panel))
+
+    app.add_handler(MessageHandler(filters.Regex("^ℹ️ راهنما$"),help_menu))
+
+    app.add_handler(MessageHandler(filters.PHOTO,receive_photo))
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,receive_value))
 
     app.run_polling()
 
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
